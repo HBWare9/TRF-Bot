@@ -826,10 +826,17 @@ async def update_ranks(ctx):
 @bot.command(name="commands")
 async def list_commands(ctx):
     """
-    Displays all available commands (no role restriction).
+    Displays all available commands that the user has access to.
     """
-    all_command_names = [command.name for command in bot.commands]
-    commands_str = "\n".join(f"!{name}" for name in all_command_names)
+    accessible_commands = []
+    for command in bot.commands:
+        try:
+            if await command.can_run(ctx):
+                accessible_commands.append(command.name)
+        except commands.CheckFailure:
+            continue
+
+    commands_str = "\n".join(f"!{name}" for name in accessible_commands)
     embed = discord.Embed(
         title="Available Commands",
         description=commands_str,
