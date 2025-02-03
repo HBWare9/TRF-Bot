@@ -1,0 +1,1030 @@
+import discord
+from discord.ext import commands
+import psycopg2
+import asyncio
+import requests
+import time
+import os
+
+# --------------------------------------------------------------------
+# Database connection (Postgres)
+# --------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is missing! Make sure it's set in Railway.")
+
+# Create a connection + cursor
+conn = psycopg2.connect(DATABASE_URL)
+cursor = conn.cursor()
+
+# Ensure the Users table exists. We'll store quota as BOOLEAN in Postgres.
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS Users (
+        DiscordID TEXT PRIMARY KEY,
+        RobloxID TEXT,
+        r_user TEXT,
+        EventsAttended INTEGER DEFAULT 0,
+        EventsHosted INTEGER DEFAULT 0,
+        FlightMinutes INTEGER DEFAULT 0,
+        QuotaMet BOOLEAN DEFAULT FALSE,
+        Rank TEXT DEFAULT 'Unknown'
+    );
+    """
+)
+conn.commit()
+
+# --------------------------------------------------------------------
+# Bot Setup
+# --------------------------------------------------------------------
+intents = discord.Intents.default()
+intents.members = True  # needed to see all members in larger servers
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+RATE_LIMIT_DELAY = 1  # delay (seconds) between external API calls
+
+# --------------------------------------------------------------------
+# Token retrieval
+# --------------------------------------------------------------------
+BOT_TOKEN = os.getenv("TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("TOKEN environment variable is missing! Make sure it's set in Railway.")
+
+# --------------------------------------------------------------------
+# Roles and IDs
+# --------------------------------------------------------------------
+allowed_role_ids = {
+    830563690901929994,
+    830563690096754709,
+    830563689618079814,
+    948638117299118170,
+    830563688918155314,
+    1087425984585805834,
+}
+
+qualifying_role_ids = [
+    830563693808844850,
+    830563693121110016,
+    830563692264554496,
+    830563691173773413,
+    830563690901929994,
+    830563690096754709,
+    830563689618079814,
+    948638117299118170,
+]
+
+REQUIRED_ROLE_ID_FOR_OTHERS = 830563689618079814
+REVIEW_CHANNEL_ID = 830573533414293525
+
+# For storing flight logs awaiting approval
+pending_flight_logs = {}  # message_id -> { user_id, minutes, origin_channel_id }
+
+# --------------------------------------------------------------------
+# Permission helpers
+# --------------------------------------------------------------------
+def user_has_any_allowed_role(member: discord.Member) -> bool:
+    """Check if the member has at least one role from 'allowed_role_ids' (for !log_event)."""
+    return any(role.id in allowed_role_ids for role in member.roles)
+
+def has_qualifying_role(member: discord.Member):
+    """Check if the member has any role from 'qualifying_role_ids'."""
+    return any(role.id in qualifying_role_ids for role in member.roles)
+
+def get_highest_qualifying_role(member: discord.Member, guild: discord.Guild):
+    """Get the highest role from 'qualifying_role_ids' that the member has, by role position."""
+    member_roles = [r for r in member.roles if r.id in qualifying_role_ids]
+    if not member_roles:
+        return None
+    # Sort by descending role position
+    member_roles.sort(key=lambda r: r.position, reverse=True)
+    return member_roles[0].name
+
+# --------------------------------------------------------------------
+# Roblox + RoVer Helpers
+# --------------------------------------------------------------------
+def fetch_latest_roblox_username(roblox_id):
+    url = f"https://users.roblox.com/v1/users/{roblox_id}"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("name", "Unknown")
+        else:
+            print(f"Error fetching username for ROBLOX ID {roblox_id}: {response.text}")
+            return "Unknown"
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching latest username: {e}")
+        return "Unknown"
+
+def fetch_roblox_id_from_rover(discord_id, guild_id):
+    """
+    Attempt to fetch a real Roblox ID from RoVer. If it fails, returns (None, None).
+    """
+    ROVER_API_KEY = "YOUR_ROVER_API_KEY_HERE"  # Replace with your real key or use an env var.
+    url = f"https://registry.rover.link/api/guilds/{guild_id}/discord-to-roblox/{discord_id}"
+    headers = {"Authorization": f"Bearer {ROVER_API_KEY}"}
+
+    try:
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 429:
+            retry_after = float(response.headers.get("Retry-After", 1.0))
+            time.sleep(retry_after)
+            return fetch_roblox_id_from_rover(discord_id, guild_id)
+
+        if response.status_code == 404:
+            return None, None
+
+        response.raise_for_status()
+        data = response.json()
+        if "robloxId" in data:
+            roblox_id = str(data["robloxId"])
+            latest_username = fetch_latest_roblox_username(roblox_id)
+            return roblox_id, latest_username
+        else:
+            return None, None
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching ROBLOX ID from RoVer: {e}")
+        return None, None
+
+# --------------------------------------------------------------------
+# Helper: Ensure a User Record
+# --------------------------------------------------------------------
+def ensure_user_record(member: discord.Member, guild: discord.Guild):
+    """
+    Ensure the user is in the database with a valid RobloxID or fallback "DISCORD-<discord_id>".
+    Returns (roblox_id, roblox_username).
+    """
+    discord_id_str = str(member.id)
+
+    cursor.execute("SELECT RobloxID, r_user FROM Users WHERE DiscordID=%s", (discord_id_str,))
+    row = cursor.fetchone()
+
+    if row:
+        existing_roblox_id, existing_user_name = row
+        if existing_roblox_id:
+            # Already have a Roblox ID or fallback, just update their rank
+            rank = get_highest_qualifying_role(member, guild) or "Unknown"
+            cursor.execute("UPDATE Users SET Rank=%s WHERE DiscordID=%s", (rank, discord_id_str))
+            conn.commit()
+            return existing_roblox_id, existing_user_name
+        else:
+            # No RobloxID => try to fetch from RoVer, else fallback
+            fetched_id, fetched_name = fetch_roblox_id_from_rover(discord_id_str, guild.id)
+            if not fetched_id:
+                fetched_id = f"DISCORD-{discord_id_str}"
+                fetched_name = member.display_name
+
+            rank = get_highest_qualifying_role(member, guild) or "Unknown"
+            cursor.execute(
+                "UPDATE Users SET RobloxID=%s, r_user=%s, Rank=%s WHERE DiscordID=%s",
+                (fetched_id, fetched_name, rank, discord_id_str)
+            )
+            conn.commit()
+            return fetched_id, fetched_name
+    else:
+        # No row => create one
+        fetched_id, fetched_name = fetch_roblox_id_from_rover(discord_id_str, guild.id)
+        if not fetched_id:
+            fetched_id = f"DISCORD-{discord_id_str}"
+            fetched_name = member.display_name
+
+        rank = get_highest_qualifying_role(member, guild) or "Unknown"
+        cursor.execute(
+            """
+            INSERT INTO Users (DiscordID, RobloxID, r_user,
+                               EventsAttended, EventsHosted,
+                               FlightMinutes, QuotaMet, Rank)
+            VALUES (%s, %s, %s, 0, 0, 0, FALSE, %s)
+            """,
+            (discord_id_str, fetched_id, fetched_name, rank)
+        )
+        conn.commit()
+        return fetched_id, fetched_name
+
+# --------------------------------------------------------------------
+# Quota-related
+# --------------------------------------------------------------------
+def recalculate_quota():
+    """
+    Recalculate ‘QuotaMet’ for all users in the database:
+      - 2 events attended, OR
+      - 2 events hosted, OR
+      - (1 event attended AND >= 30 flight minutes)
+    """
+    cursor.execute("SELECT DiscordID, EventsAttended, EventsHosted, FlightMinutes FROM Users")
+    rows = cursor.fetchall()
+
+    for (disc_id, attended, hosted, flight_minutes) in rows:
+        attended = attended or 0
+        hosted = hosted or 0
+        flight_minutes = flight_minutes or 0
+
+        meets_quota = (
+            (attended >= 2)
+            or (hosted >= 2)
+            or (attended >= 1 and flight_minutes >= 30)
+        )
+        cursor.execute("UPDATE Users SET QuotaMet=%s WHERE DiscordID=%s", (meets_quota, disc_id))
+
+    conn.commit()
+    print("Quota recalculated for all users.")
+
+# --------------------------------------------------------------------
+# Decorator to restrict commands to a specific role
+# --------------------------------------------------------------------
+def require_specific_role(role_id):
+    def predicate(ctx):
+        return any(r.id == role_id for r in ctx.author.roles)
+    return commands.check(predicate)
+
+# --------------------------------------------------------------------
+# Everyone can use !log_flight
+# --------------------------------------------------------------------
+@bot.command(name="log_flight")
+async def log_flight(ctx):
+    def check_author(m):
+        return (m.author == ctx.author) and (m.channel == ctx.channel)
+
+    # Step 1: ask for minutes
+    await ctx.send("✈️ How many minutes would you like to log?")
+    try:
+        minutes_msg = await bot.wait_for("message", timeout=60.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ You took too long to respond. Please try again.")
+        return
+
+    # Validate minutes
+    try:
+        minutes = int(minutes_msg.content)
+        if minutes <= 0:
+            await ctx.send("❌ Minutes must be a positive integer.")
+            return
+    except ValueError:
+        await ctx.send("❌ Please enter a valid number of minutes.")
+        return
+
+    # Step 2: screenshot prompt
+    await ctx.send("📸 Please provide a screenshot of your flight time.")
+    try:
+        screenshot_msg = await bot.wait_for("message", timeout=120.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ You took too long to provide a screenshot. Please try again.")
+        return
+
+    if not screenshot_msg.attachments:
+        await ctx.send("❌ No attachment detected. Please try again and provide a screenshot.")
+        return
+
+    attachment_url = screenshot_msg.attachments[0].url
+    review_channel = bot.get_channel(REVIEW_CHANNEL_ID)
+    if review_channel is None:
+        await ctx.send("❌ Could not find the review channel. Contact an administrator.")
+        return
+
+    # Send an embed for review
+    embed = discord.Embed(title="Flight Log Review", color=discord.Color.blue())
+    embed.add_field(name="User", value=ctx.author.display_name, inline=True)
+    embed.add_field(name="Minutes", value=str(minutes), inline=True)
+    embed.set_image(url=attachment_url)
+
+    review_message = await review_channel.send(embed=embed)
+    pending_flight_logs[review_message.id] = {
+        "user_id": ctx.author.id,
+        "minutes": minutes,
+        "origin_channel_id": ctx.channel.id,
+    }
+
+    # Add approve/deny reactions
+    await review_message.add_reaction("✅")
+    await review_message.add_reaction("❌")
+
+    await ctx.send("✅ Your flight log has been submitted for review. Please wait for approval.")
+
+# --------------------------------------------------------------------
+# !log_event restricted to roles in allowed_role_ids
+# --------------------------------------------------------------------
+@bot.command(name="log_event")
+async def log_event(ctx):
+    if not user_has_any_allowed_role(ctx.author):
+        await ctx.send("❌ You do not have permission to use this command.")
+        return
+
+    await ctx.guild.chunk()
+
+    def check_author(m):
+        return (m.author == ctx.author) and (m.channel == ctx.channel)
+
+    # Co-host
+    await ctx.send(
+        "Please **mention your co-host** (one user) or type **`none`** if no co-host.\n"
+        "You have 60 seconds to respond."
+    )
+    try:
+        cohost_msg = await bot.wait_for("message", timeout=60.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ You took too long. Command cancelled.")
+        return
+
+    cohost_user = None
+    cohost_text = cohost_msg.content.strip().lower()
+    if cohost_text == "none":
+        cohost_user = None
+    elif cohost_msg.mentions:
+        cohost_user = cohost_msg.mentions[0]
+    else:
+        await ctx.send("❌ Could not parse a valid co-host mention. No co-host will be set.")
+        cohost_user = None
+
+    # Event name
+    await ctx.send("Please **enter the event name** (e.g., 'Basic Flight Training'). You have 60 seconds.")
+    try:
+        event_name_msg = await bot.wait_for("message", timeout=60.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ You took too long. Command cancelled.")
+        return
+
+    event_name = event_name_msg.content.strip()
+    if not event_name:
+        await ctx.send("No event name provided. Command cancelled.")
+        return
+
+    # Collect attendees
+    attendees_input = []
+    await ctx.send(
+        "**Enter each attendee one by one** (mention OR numeric Roblox ID).\n"
+        "Type **`done`** when finished. You have 60 seconds per entry."
+    )
+    while True:
+        try:
+            msg = await bot.wait_for("message", timeout=60.0, check=check_author)
+        except asyncio.TimeoutError:
+            await ctx.send("❌ You took too long to respond. Command cancelled.")
+            return
+
+        content = msg.content.strip()
+        if content.lower() == "done":
+            await ctx.send("✅ Finished collecting attendees.")
+            break
+        attendees_input.append(msg)
+        await ctx.send(f"Got: `{content}`. Enter another attendee or `done`...")
+
+    if not attendees_input:
+        await ctx.send("No attendees were provided. Command cancelled.")
+        return
+
+    # Screenshot proof
+    await ctx.send("📸 Please provide a screenshot for proof of the event. You have 120 seconds.")
+    try:
+        proof_msg = await bot.wait_for("message", timeout=120.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ You took too long to provide a screenshot. Command cancelled.")
+        return
+
+    if not proof_msg.attachments:
+        await ctx.send("❌ No screenshot detected. Command cancelled.")
+        return
+
+    screenshot_url = proof_msg.attachments[0].url
+
+    # Update DB for each attendee
+    attendee_pings_for_summary = []
+    attendees_processed = []
+
+    for attendee_msg in attendees_input:
+        content = attendee_msg.content.strip()
+        mention_list = attendee_msg.mentions
+
+        if mention_list:
+            # Attendee was a mention (a Discord user in this server)
+            attendee_member = mention_list[0]
+            ensure_user_record(attendee_member, ctx.guild)
+            cursor.execute(
+                "UPDATE Users SET EventsAttended=EventsAttended+1 WHERE DiscordID=%s",
+                (str(attendee_member.id),)
+            )
+            conn.commit()
+
+            attendees_processed.append(str(attendee_member.id))
+            attendee_pings_for_summary.append(attendee_member.mention)
+
+        elif content.isdigit():
+            # The input is a numeric Roblox ID
+            roblox_id = content
+            roblox_username = fetch_latest_roblox_username(roblox_id)
+            cursor.execute("SELECT DiscordID FROM Users WHERE RobloxID=%s", (roblox_id,))
+            row = cursor.fetchone()
+
+            if row:
+                # Already in the DB with some DiscordID
+                cursor.execute(
+                    "UPDATE Users SET EventsAttended=EventsAttended+1 WHERE RobloxID=%s",
+                    (roblox_id,)
+                )
+                conn.commit()
+                attendees_processed.append(str(row[0]))
+            else:
+                # Create a new record with DiscordID='0' since we don't know their real Discord ID
+                cursor.execute(
+                    """
+                    INSERT INTO Users (DiscordID, RobloxID, r_user, EventsAttended, EventsHosted,
+                                       FlightMinutes, QuotaMet, Rank)
+                    VALUES (%s, %s, %s, 1, 0, 0, FALSE, %s)
+                    """,
+                    ("0", roblox_id, roblox_username, "Unknown")
+                )
+                conn.commit()
+                attendees_processed.append("0")
+            attendee_pings_for_summary.append(f"RobloxID:{roblox_id}")
+
+        else:
+            await ctx.send(f"❌ Could not parse attendee: `{content}`. Skipping.")
+            continue
+
+        await asyncio.sleep(RATE_LIMIT_DELAY)
+
+    # Host
+    ensure_user_record(ctx.author, ctx.guild)
+    cursor.execute(
+        "UPDATE Users SET EventsHosted=EventsHosted+1 WHERE DiscordID=%s",
+        (str(ctx.author.id),)
+    )
+    conn.commit()
+
+    # Co-host
+    cohost_mention_str = "None"
+    if cohost_user is not None:
+        cohost_mention_str = cohost_user.mention
+        ensure_user_record(cohost_user, ctx.guild)
+        cursor.execute(
+            "UPDATE Users SET EventsHosted=EventsHosted+1 WHERE DiscordID=%s",
+            (str(cohost_user.id),)
+        )
+        conn.commit()
+
+    # Recalculate quota
+    recalculate_quota()
+
+    # Final summary
+    final_channel = bot.get_channel(830596103434534932)
+    if final_channel is None:
+        final_channel = ctx.channel
+
+    host_mention = ctx.author.mention
+    attendees_str = ", ".join(attendee_pings_for_summary) if attendee_pings_for_summary else "None"
+
+    await final_channel.send("✅ **Event logging complete!**")
+    await final_channel.send(
+        f"Host: {host_mention}\n"
+        f"Co-host: {cohost_mention_str}\n"
+        f"Event: {event_name}\n"
+        f"Attendees: {attendees_str}\n"
+        f"Proof: {screenshot_url}"
+    )
+
+    if attendees_processed:
+        await final_channel.send(f"**Attendees DB Updated:** {', '.join(attendees_processed)}")
+
+# --------------------------------------------------------------------
+# ALL OTHER COMMANDS restricted to REQUIRED_ROLE_ID_FOR_OTHERS
+# --------------------------------------------------------------------
+@bot.command(name="register")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def register(ctx, roblox_id: str):
+    """
+    Let a user manually set their own Roblox ID (overrides fallback).
+    """
+    discord_id = str(ctx.author.id)
+    latest_username = fetch_latest_roblox_username(roblox_id)
+    rank = get_highest_qualifying_role(ctx.author, ctx.guild) or "Unknown"
+
+    cursor.execute("SELECT * FROM Users WHERE DiscordID=%s", (discord_id,))
+    row = cursor.fetchone()
+
+    if row:
+        # Update existing record
+        cursor.execute(
+            "UPDATE Users SET RobloxID=%s, r_user=%s, Rank=%s WHERE DiscordID=%s",
+            (roblox_id, latest_username, rank, discord_id)
+        )
+        await ctx.send(
+            f"Your ROBLOX ID has been updated to {roblox_id} (username {latest_username}), rank {rank}."
+        )
+    else:
+        # Create new record
+        cursor.execute(
+            """
+            INSERT INTO Users (DiscordID, RobloxID, r_user,
+                               EventsAttended, EventsHosted,
+                               FlightMinutes, QuotaMet, Rank)
+            VALUES (%s, %s, %s, 0, 0, 0, FALSE, %s)
+            """,
+            (discord_id, roblox_id, latest_username, rank)
+        )
+        await ctx.send(
+            f"Your ROBLOX ID {roblox_id} (username {latest_username}) rank {rank} has been registered."
+        )
+
+    conn.commit()
+
+@bot.command(name="report_quota")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def report_quota(ctx):
+    """
+    Shows all users who have NOT met their quota, in a nicer format.
+    Also recalculates quota first.
+    If a user left the server, remove them from DB instead of listing them.
+    """
+    recalculate_quota()
+    cursor.execute("SELECT DiscordID FROM Users WHERE QuotaMet=false")
+    rows = cursor.fetchall()
+
+    if not rows:
+        embed = discord.Embed(
+            title="Quota Report",
+            description="All users met their quota!",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    lines = []
+    removed_count = 0
+
+    for (disc_id_str,) in rows:
+        if disc_id_str.isdigit():
+            member = ctx.guild.get_member(int(disc_id_str))
+            if not member:
+                # user left, remove from DB
+                cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+                conn.commit()
+                removed_count += 1
+            else:
+                lines.append(f"• {member.mention}")
+        else:
+            # if DiscordID not numeric, remove
+            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+            conn.commit()
+            removed_count += 1
+
+    if not lines:
+        embed = discord.Embed(
+            title="Quota Report",
+            description=f"All non-quota users have left. Removed {removed_count} records.\nNo one left to report!",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    def chunk_string(txt, limit=1800):
+        return [txt[i : i + limit] for i in range(0, len(txt), limit)]
+
+    big_text = "\n".join(lines)
+    chunks = chunk_string(big_text)
+    for i, chunk in enumerate(chunks, start=1):
+        embed = discord.Embed(
+            title=f"Users who did not meet quota (Page {i}/{len(chunks)})",
+            description=chunk,
+            color=discord.Color.red()
+        )
+        if removed_count > 0 and i == 1:
+            embed.set_footer(text=f"Removed {removed_count} DB entries for ex-members.")
+        await ctx.send(embed=embed)
+
+@bot.command(name="check_quota")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def check_quota(ctx):
+    recalculate_quota()
+    await ctx.send("Quota recalculated for all users.")
+
+@bot.command(name="add_qualified_members")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def add_qualified_members(ctx):
+    """
+    For each member in the server who has a qualifying role, ensure they're in the DB.
+    """
+    added_count = 0
+    await ctx.guild.chunk()
+
+    for member in ctx.guild.members:
+        if has_qualifying_role(member):
+            disc_id_str = str(member.id)
+            cursor.execute("SELECT DiscordID FROM Users WHERE DiscordID=%s", (disc_id_str,))
+            row = cursor.fetchone()
+            if not row:
+                ensure_user_record(member, ctx.guild)
+                added_count += 1
+
+    await ctx.send(f"{added_count} members with qualifying roles were ensured in the database.")
+
+@bot.command(name="check_missing_entries")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def check_missing_entries(ctx):
+    """
+    We consider 'missing' if RobloxID is DISCORD-xx or '0' or empty,
+    or if r_user is null/empty. We'll show them in a nice embed.
+    """
+    query = """
+    SELECT DiscordID, RobloxID, r_user
+    FROM Users
+    WHERE
+       (RobloxID IS NULL OR RobloxID='' OR RobloxID LIKE 'DISCORD-%' OR RobloxID='0')
+       OR
+       (r_user IS NULL OR r_user='')
+    """
+    cursor.execute(query)
+    rows = cursor.fetchall()
+
+    if not rows:
+        embed = discord.Embed(
+            title="Missing Entries",
+            description="No fallback/empty entries found.",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    lines = []
+    for (d_id, rb_id, r_user_val) in rows:
+        if d_id.isdigit() and d_id != "0":
+            lines.append(f"• <@{d_id}> => RobloxID: {rb_id}, r_user: {r_user_val}")
+        else:
+            lines.append(f"• DiscordID: {d_id}, RobloxID: {rb_id}, r_user: {r_user_val}")
+
+    def chunk_string(txt, limit=1800):
+        return [txt[i : i + limit] for i in range(0, len(txt), limit)]
+
+    big_list_str = "\n".join(lines)
+    chunks = chunk_string(big_list_str)
+    for i, chunk in enumerate(chunks, start=1):
+        embed = discord.Embed(
+            title=f"Missing Entries (Page {i}/{len(chunks)})",
+            description=chunk,
+            color=discord.Color.gold()
+        )
+        await ctx.send(embed=embed)
+
+@bot.command(name="log_all_members")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def log_all_members(ctx):
+    """
+    Iterate through all members, ensure they have a record if they have a qualifying role.
+    If they have a fallback or no record, update them accordingly.
+    """
+    await ctx.guild.chunk()
+    updated_count = 0
+
+    for member in ctx.guild.members:
+        if has_qualifying_role(member):
+            disc_id_str = str(member.id)
+            cursor.execute("SELECT RobloxID FROM Users WHERE DiscordID=%s", (disc_id_str,))
+            old_row = cursor.fetchone()
+
+            roblox_id, roblox_name = ensure_user_record(member, ctx.guild)
+            if not old_row or not old_row[0] or old_row[0].startswith("DISCORD-"):
+                updated_count += 1
+                await ctx.send(
+                    f"✅ Ensured {member.mention} => RobloxID: {roblox_id}, Username: {roblox_name}"
+                )
+
+            await asyncio.sleep(RATE_LIMIT_DELAY)
+
+    await ctx.send(f"✅ log_all_members completed. {updated_count} records updated or added.")
+
+@bot.command(name="ping_unregistered")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def ping_unregistered(ctx):
+    """
+    Finds entries in the DB where RobloxID is 'DISCORD-xx' and pings them if they're still in the server.
+    If they left, remove them from DB.
+    """
+    cursor.execute("SELECT DiscordID FROM Users WHERE RobloxID LIKE 'DISCORD-%'")
+    rows = cursor.fetchall()
+
+    if not rows:
+        embed = discord.Embed(
+            title="Unregistered Users",
+            description="No fallback/unregistered users found.",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    lines = []
+    removed_count = 0
+
+    for (d_id,) in rows:
+        if d_id.isdigit():
+            member = ctx.guild.get_member(int(d_id))
+            if member:
+                lines.append(f"• {member.mention}")
+            else:
+                # remove from DB
+                cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (d_id,))
+                conn.commit()
+                removed_count += 1
+        else:
+            # also remove
+            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (d_id,))
+            conn.commit()
+            removed_count += 1
+
+    if not lines:
+        embed = discord.Embed(
+            title="Unregistered Users",
+            description=f"All fallback users have left; removed {removed_count} records.",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    def chunk_string(txt, limit=1800):
+        return [txt[i : i + limit] for i in range(0, len(txt), limit)]
+
+    big_str = "\n".join(lines)
+    chunks = chunk_string(big_str)
+    for i, chunk in enumerate(chunks, start=1):
+        embed = discord.Embed(
+            title=f"Fallback Users (Page {i}/{len(chunks)})",
+            description=chunk,
+            color=discord.Color.orange()
+        )
+        if removed_count > 0 and i == 1:
+            embed.set_footer(text=f"Removed {removed_count} DB entries for ex-members.")
+        await ctx.send(embed=embed)
+
+@bot.command(name="purge_database")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def purge_database(ctx):
+    await ctx.send(
+        "⚠️ **Are you sure you want to purge the database?**\n"
+        "Type `confirm` to proceed or `cancel` to abort."
+    )
+
+    def check_confirm(m):
+        return (
+            m.author == ctx.author
+            and m.channel == ctx.channel
+            and m.content.lower() in ["confirm", "cancel"]
+        )
+
+    try:
+        response = await bot.wait_for("message", timeout=30.0, check=check_confirm)
+        if response.content.lower() == "confirm":
+            cursor.execute("DELETE FROM Users")
+            conn.commit()
+            await ctx.send("The database has been purged. All records are deleted.")
+        else:
+            await ctx.send("Purge operation cancelled.")
+    except asyncio.TimeoutError:
+        await ctx.send("No response received. Operation cancelled.")
+
+@bot.command(name="test")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def test(ctx):
+    await ctx.send("The bot is working!")
+
+@bot.command(name="update_ranks")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def update_ranks(ctx):
+    """
+    Go through the DB, find each user, and update 'Rank' based on their highest qualifying role.
+    If the user has left, remove them from the DB.
+    """
+    cursor.execute("SELECT DiscordID FROM Users")
+    all_users = cursor.fetchall()
+
+    updated_count = 0
+    removed_count = 0
+    await ctx.guild.chunk()
+
+    for (disc_id_str,) in all_users:
+        if disc_id_str.isdigit():
+            member = ctx.guild.get_member(int(disc_id_str))
+            if member:
+                rank = get_highest_qualifying_role(member, ctx.guild) or "Unknown"
+                cursor.execute("UPDATE Users SET Rank=%s WHERE DiscordID=%s", (rank, disc_id_str))
+                updated_count += 1
+            else:
+                # remove from DB
+                cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+                removed_count += 1
+        else:
+            # also remove if not numeric
+            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+            removed_count += 1
+
+    conn.commit()
+    await ctx.send(f"✅ Updated ranks for {updated_count} users. Removed {removed_count} who left.")
+
+# --------------------------------------------------------------------
+# 1) Everyone can use !commands
+# --------------------------------------------------------------------
+@bot.command(name="commands")
+async def list_commands(ctx):
+    """
+    Displays all available commands (no role restriction).
+    """
+    all_command_names = [command.name for command in bot.commands]
+    commands_str = "\n".join(f"!{name}" for name in all_command_names)
+    embed = discord.Embed(
+        title="Available Commands",
+        description=commands_str,
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed)
+
+# --------------------------------------------------------------------
+# 2) Everyone can use !lookup
+# --------------------------------------------------------------------
+@bot.command(name="lookup")
+async def lookup(ctx, user: discord.Member):
+    """
+    Usage: !lookup @someuser
+    Displays that user's info if present in the DB (no role restriction).
+    """
+    disc_id_str = str(user.id)
+    cursor.execute(
+        """
+        SELECT RobloxID, r_user, EventsAttended, EventsHosted, FlightMinutes, QuotaMet
+        FROM Users
+        WHERE DiscordID=%s
+        """,
+        (disc_id_str,)
+    )
+    row = cursor.fetchone()
+
+    if not row:
+        await ctx.send(f"No database entry found for {user.mention}.")
+        return
+
+    roblox_id, r_user_val, attended, hosted, flight_mins, quota_met = row
+    attended = attended or 0
+    hosted = hosted or 0
+    flight_mins = flight_mins or 0
+    quota_str = "Yes" if quota_met else "No"
+
+    embed = discord.Embed(
+        title=f"Lookup for {user.display_name}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Discord ID", value=disc_id_str, inline=True)
+    embed.add_field(name="Roblox ID", value=roblox_id or "None", inline=True)
+    embed.add_field(name="r_user", value=r_user_val or "None", inline=True)
+    embed.add_field(name="Events Attended", value=str(attended), inline=True)
+    embed.add_field(name="Events Hosted", value=str(hosted), inline=True)
+    embed.add_field(name="Flight Minutes", value=str(flight_mins), inline=True)
+    embed.add_field(name="Quota Complete", value=quota_str, inline=True)
+
+    await ctx.send(embed=embed)
+
+# --------------------------------------------------------------------
+# 3) New command: !wipe_user (Resets one user's counters)
+# --------------------------------------------------------------------
+@bot.command(name="wipe_user")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def wipe_user(ctx, user: discord.Member):
+    """
+    Usage: !wipe_user @Member
+    Resets a single user's counters: EventsAttended=0, EventsHosted=0,
+    FlightMinutes=0, QuotaMet=FALSE. Keeps RobloxID, r_user, Rank intact.
+    """
+    disc_id_str = str(user.id)
+    # Check if user exists in DB
+    cursor.execute("SELECT DiscordID FROM Users WHERE DiscordID=%s", (disc_id_str,))
+    row = cursor.fetchone()
+
+    if not row:
+        await ctx.send(f"No database record found for {user.mention}.")
+        return
+
+    cursor.execute(
+        """
+        UPDATE Users
+        SET EventsAttended=0,
+            EventsHosted=0,
+            FlightMinutes=0,
+            QuotaMet=FALSE
+        WHERE DiscordID=%s
+        """,
+        (disc_id_str,)
+    )
+    conn.commit()
+    await ctx.send(f"✅ {user.mention}'s counters have been reset to 0 and QuotaMet set to False.")
+
+# --------------------------------------------------------------------
+# 4) New command: !reset_quota (Resets everyone's counters)
+# --------------------------------------------------------------------
+@bot.command(name="reset_quota")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def reset_quota_command(ctx):
+    """
+    Usage: !reset_quota
+    Resets EVERYONE's counters in the DB:
+    - EventsAttended = 0
+    - EventsHosted = 0
+    - FlightMinutes = 0
+    - QuotaMet = FALSE
+    """
+    cursor.execute(
+        """
+        UPDATE Users
+        SET EventsAttended=0,
+            EventsHosted=0,
+            FlightMinutes=0,
+            QuotaMet=FALSE
+        """
+    )
+    conn.commit()
+    await ctx.send("✅ All users' counters have been reset to 0, and QuotaMet set to False.")
+
+# --------------------------------------------------------------------
+# EVENTS
+# --------------------------------------------------------------------
+@bot.event
+async def on_ready():
+    print(f"Bot is ready! Logged in as {bot.user}")
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    # Ignore bots
+    if user.bot:
+        return
+
+    # Check if reaction is in the designated review channel
+    if reaction.message.channel.id != REVIEW_CHANNEL_ID:
+        return
+
+    msg_id = reaction.message.id
+    if msg_id not in pending_flight_logs:
+        return
+
+    flight_log = pending_flight_logs[msg_id]
+    flight_user_id = flight_log["user_id"]
+    minutes = flight_log["minutes"]
+    origin_channel_id = flight_log["origin_channel_id"]
+
+    if str(reaction.emoji) not in ["✅", "❌"]:
+        return
+
+    origin_channel = bot.get_channel(origin_channel_id)
+
+    if str(reaction.emoji) == "✅":
+        # Approved => ensure user record, add flight minutes
+        disc_id = str(flight_user_id)
+        print(f"Approving flight log for user {flight_user_id} with {minutes} minutes.")
+
+        member = reaction.message.guild.get_member(flight_user_id)
+        if member:
+            ensure_user_record(member, reaction.message.guild)
+            cursor.execute(
+                "UPDATE Users SET FlightMinutes = FlightMinutes + %s WHERE DiscordID = %s",
+                (minutes, disc_id)
+            )
+            conn.commit()
+            recalculate_quota()
+
+            if origin_channel:
+                await origin_channel.send(
+                    f"✅ <@{flight_user_id}>, your flight log has been approved "
+                    f"and {minutes} minutes have been added to your record."
+                )
+            else:
+                try:
+                    await user.send(
+                        f"✅ Your flight log has been approved and {minutes} minutes have been added."
+                    )
+                except discord.Forbidden:
+                    pass
+        else:
+            # The user left => remove them from the DB
+            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id,))
+            conn.commit()
+            if origin_channel:
+                await origin_channel.send(
+                    f"❌ We could not find that user in the server; removed them from the DB."
+                )
+            else:
+                try:
+                    await user.send("❌ Could not find your Member record. Removed from DB.")
+                except discord.Forbidden:
+                    pass
+
+    elif str(reaction.emoji) == "❌":
+        # Denied
+        if origin_channel:
+            await origin_channel.send(f"❌ <@{flight_user_id}>, your flight log has been denied.")
+        else:
+            try:
+                await user.send("❌ Your flight log has been denied.")
+            except discord.Forbidden:
+                pass
+
+    # Remove from pending logs
+    del pending_flight_logs[msg_id]
+
+# --------------------------------------------------------------------
+# RUN THE BOT
+# --------------------------------------------------------------------
+bot.run(BOT_TOKEN)
