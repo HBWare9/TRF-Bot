@@ -75,7 +75,7 @@ qualifying_role_ids = [
 ]
 
 REQUIRED_ROLE_ID_FOR_OTHERS = 830563689618079814
-REVIEW_CHANNEL_ID = 830573533414293525
+REVIEW_CHANNEL_ID = 897184372027969576
 
 # For storing flight logs awaiting approval
 pending_flight_logs = {}  # message_id -> { user_id, minutes, origin_channel_id }
