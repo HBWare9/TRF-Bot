@@ -36,6 +36,16 @@ cursor.execute(
 )
 conn.commit()
 
+# Now, add columns for inactivity if they don't exist.
+cursor.execute("""
+    ALTER TABLE Users
+    ADD COLUMN IF NOT EXISTS Inactive BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS InactiveStart DATE,
+    ADD COLUMN IF NOT EXISTS InactiveEnd DATE,
+    ADD COLUMN IF NOT EXISTS InactiveReason TEXT;
+""")
+conn.commit()
+
 # --------------------------------------------------------------------
 # Bot Setup
 # --------------------------------------------------------------------
@@ -79,8 +89,14 @@ qualifying_role_ids = [
 REQUIRED_ROLE_ID_FOR_OTHERS = 830563689618079814
 REVIEW_CHANNEL_ID = 897184372027969576
 
+# NEW: Inactivity approval channel
+INACTIVITY_APPROVAL_CHANNEL_ID = 897184372027969576  # Replace with your actual channel ID
+
 # For storing flight logs awaiting approval
 pending_flight_logs = {}  # message_id -> { user_id, minutes, origin_channel_id }
+
+# For storing inactivity requests awaiting approval
+pending_inactivity_requests = {}  # message_id -> { user_id, start_date, end_date, reason }
 
 # --------------------------------------------------------------------
 # Permission helpers
@@ -242,7 +258,7 @@ def require_specific_role(role_id):
     return commands.check(predicate)
 
 # --------------------------------------------------------------------
-# Everyone can use !log_flight
+# !log_flight (everyone can use)
 # --------------------------------------------------------------------
 @bot.command(name="log_flight")
 async def log_flight(ctx):
@@ -889,7 +905,7 @@ async def lookup(ctx, user: discord.Member):
     await ctx.send(embed=embed)
 
 # --------------------------------------------------------------------
-# 3) New command: !wipe_user (Resets one user's counters)
+# 3) !wipe_user (Resets one user's counters)
 # --------------------------------------------------------------------
 @bot.command(name="wipe_user")
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
@@ -923,7 +939,7 @@ async def wipe_user(ctx, user: discord.Member):
     await ctx.send(f"✅ {user.mention}'s counters have been reset to 0 and QuotaMet set to False.")
 
 # --------------------------------------------------------------------
-# 4) New command: !reset_quota (Resets everyone's counters)
+# 4) !reset_quota (Resets everyone's counters)
 # --------------------------------------------------------------------
 @bot.command(name="reset_quota")
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
@@ -949,6 +965,127 @@ async def reset_quota_command(ctx):
     await ctx.send("✅ All users' counters have been reset to 0, and QuotaMet set to False.")
 
 # --------------------------------------------------------------------
+# NEW COMMAND: !request_inactivity
+# --------------------------------------------------------------------
+@bot.command(name="request_inactivity")
+async def request_inactivity(ctx):
+    """
+    A multi-step command to request inactivity:
+      1) Asks user for start date (YYYY-MM-DD).
+      2) Asks user for end date (YYYY-MM-DD).
+      3) Asks user for reason.
+      4) Posts an embed in the inactivity approval channel for staff to approve/deny.
+    """
+    def check_author(m):
+        return (m.author == ctx.author and m.channel == ctx.channel)
+    
+    # Step 1: Ask for start date
+    await ctx.send("📅 Please provide your **start date** for inactivity (YYYY-MM-DD). You have 60s.")
+    try:
+        start_msg = await bot.wait_for("message", timeout=60.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ You took too long. Inactivity request cancelled.")
+        return
+    
+    start_date_str = start_msg.content.strip()
+    # Optionally validate the format
+    try:
+        time.strptime(start_date_str, "%Y-%m-%d")
+    except ValueError:
+        await ctx.send("❌ Invalid date format. Use YYYY-MM-DD. Request cancelled.")
+        return
+    
+    # Step 2: Ask for end date
+    await ctx.send("📅 Please provide your **end date** for inactivity (YYYY-MM-DD). You have 60s.")
+    try:
+        end_msg = await bot.wait_for("message", timeout=60.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ You took too long. Inactivity request cancelled.")
+        return
+    
+    end_date_str = end_msg.content.strip()
+    try:
+        time.strptime(end_date_str, "%Y-%m-%d")
+    except ValueError:
+        await ctx.send("❌ Invalid date format. Use YYYY-MM-DD. Request cancelled.")
+        return
+    
+    # Step 3: Reason for inactivity
+    await ctx.send("✏️ Please provide the **reason** for your inactivity. You have 120s.")
+    try:
+        reason_msg = await bot.wait_for("message", timeout=120.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ You took too long. Inactivity request cancelled.")
+        return
+    
+    reason = reason_msg.content.strip()
+    if not reason:
+        await ctx.send("❌ No reason provided. Request cancelled.")
+        return
+    
+    # Step 4: Post to the inactivity approval channel
+    inactivity_channel = bot.get_channel(INACTIVITY_APPROVAL_CHANNEL_ID)
+    if not inactivity_channel:
+        await ctx.send("❌ Could not find the inactivity approval channel. Contact an admin.")
+        return
+    
+    embed = discord.Embed(
+        title="Inactivity Request",
+        color=discord.Color.orange(),
+        description=(
+            f"**User:** {ctx.author.mention}\n"
+            f"**Start Date:** {start_date_str}\n"
+            f"**End Date:** {end_date_str}\n"
+            f"**Reason:** {reason}\n"
+        )
+    )
+    embed.set_footer(text="React with ✅ to approve or ❌ to deny.")
+
+    approval_message = await inactivity_channel.send(embed=embed)
+    await approval_message.add_reaction("✅")
+    await approval_message.add_reaction("❌")
+    
+    # Store this request in the pending dict
+    pending_inactivity_requests[approval_message.id] = {
+        "user_id": ctx.author.id,
+        "start_date": start_date_str,
+        "end_date": end_date_str,
+        "reason": reason
+    }
+    
+    await ctx.send("✅ Your inactivity request has been submitted for approval.")
+
+# --------------------------------------------------------------------
+# Optional Command: end_inactivity
+# --------------------------------------------------------------------
+@bot.command(name="end_inactivity")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def end_inactivity(ctx, user: discord.Member):
+    """
+    Usage: !end_inactivity @Member
+    Sets the user as active again in the DB, clearing inactivity fields.
+    """
+    disc_id_str = str(user.id)
+    cursor.execute("SELECT DiscordID FROM Users WHERE DiscordID=%s", (disc_id_str,))
+    row = cursor.fetchone()
+    
+    if not row:
+        await ctx.send(f"No database record found for {user.mention}.")
+        return
+    
+    cursor.execute("""
+        UPDATE Users
+        SET Inactive=FALSE,
+            InactiveStart=NULL,
+            InactiveEnd=NULL,
+            InactiveReason=NULL
+        WHERE DiscordID=%s
+    """, (disc_id_str,))
+    conn.commit()
+    
+    await ctx.send(f"✅ {user.mention} is now marked as active.")
+
+# --------------------------------------------------------------------
 # EVENTS
 # --------------------------------------------------------------------
 @bot.event
@@ -961,77 +1098,111 @@ async def on_reaction_add(reaction, user):
     if user.bot:
         return
 
-    # Check if reaction is in the designated review channel
-    if reaction.message.channel.id != REVIEW_CHANNEL_ID:
+    # We allow:
+    #  - Flight log approvals in REVIEW_CHANNEL_ID
+    #  - Inactivity requests in INACTIVITY_APPROVAL_CHANNEL_ID
+    if reaction.message.channel.id not in [REVIEW_CHANNEL_ID, INACTIVITY_APPROVAL_CHANNEL_ID]:
         return
 
     msg_id = reaction.message.id
-    if msg_id not in pending_flight_logs:
-        return
+    
+    # 1) Check if it's a flight log
+    if msg_id in pending_flight_logs:
+        flight_log = pending_flight_logs[msg_id]
+        flight_user_id = flight_log["user_id"]
+        minutes = flight_log["minutes"]
+        origin_channel_id = flight_log["origin_channel_id"]
 
-    flight_log = pending_flight_logs[msg_id]
-    flight_user_id = flight_log["user_id"]
-    minutes = flight_log["minutes"]
-    origin_channel_id = flight_log["origin_channel_id"]
+        if str(reaction.emoji) not in ["✅", "❌"]:
+            return
 
-    if str(reaction.emoji) not in ["✅", "❌"]:
-        return
+        origin_channel = bot.get_channel(origin_channel_id)
 
-    origin_channel = bot.get_channel(origin_channel_id)
-
-    if str(reaction.emoji) == "✅":
-        # Approved => ensure user record, add flight minutes
-        disc_id = str(flight_user_id)
-        print(f"Approving flight log for user {flight_user_id} with {minutes} minutes.")
-
-        member = reaction.message.guild.get_member(flight_user_id)
-        if member:
-            ensure_user_record(member, reaction.message.guild)
-            cursor.execute(
-                "UPDATE Users SET FlightMinutes = FlightMinutes + %s WHERE DiscordID = %s",
-                (minutes, disc_id)
-            )
-            conn.commit()
-            recalculate_quota()
-
-            if origin_channel:
-                await origin_channel.send(
-                    f"✅ <@{flight_user_id}>, your flight log has been approved "
-                    f"and {minutes} minutes have been added to your record."
+        if str(reaction.emoji) == "✅":
+            # Approved flight log
+            disc_id = str(flight_user_id)
+            member = reaction.message.guild.get_member(flight_user_id)
+            if member:
+                ensure_user_record(member, reaction.message.guild)
+                cursor.execute(
+                    "UPDATE Users SET FlightMinutes = FlightMinutes + %s WHERE DiscordID = %s",
+                    (minutes, disc_id)
                 )
+                conn.commit()
+                recalculate_quota()
+                if origin_channel:
+                    await origin_channel.send(
+                        f"✅ <@{flight_user_id}>, your flight log has been approved "
+                        f"and {minutes} minutes have been added to your record."
+                    )
             else:
+                # user left => remove from DB
+                cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id,))
+                conn.commit()
+                if origin_channel:
+                    await origin_channel.send(
+                        f"❌ We could not find that user in the server; removed them from the DB."
+                    )
+
+        elif str(reaction.emoji) == "❌":
+            # Denied flight log
+            if origin_channel:
+                await origin_channel.send(f"❌ <@{flight_user_id}>, your flight log has been denied.")
+
+        # Remove from the pending logs
+        del pending_flight_logs[msg_id]
+
+    # 2) Check if it's an inactivity request
+    elif msg_id in pending_inactivity_requests:
+        if str(reaction.emoji) not in ["✅", "❌"]:
+            return
+        
+        inactivity_request = pending_inactivity_requests[msg_id]
+        request_user_id = inactivity_request["user_id"]
+        start_date_str = inactivity_request["start_date"]
+        end_date_str = inactivity_request["end_date"]
+        reason = inactivity_request["reason"]
+
+        if str(reaction.emoji) == "✅":
+            # Approved => set the user as inactive in DB
+            disc_id = str(request_user_id)
+            member = reaction.message.guild.get_member(request_user_id)
+            if member:
+                ensure_user_record(member, reaction.message.guild)
+                cursor.execute(
+                    """
+                    UPDATE Users
+                    SET Inactive = TRUE,
+                        InactiveStart = %s,
+                        InactiveEnd = %s,
+                        InactiveReason = %s
+                    WHERE DiscordID = %s
+                    """,
+                    (start_date_str, end_date_str, reason, disc_id)
+                )
+                conn.commit()
+                # Optionally DM the user
                 try:
-                    await user.send(
-                        f"✅ Your flight log has been approved and {minutes} minutes have been added."
+                    await member.send(
+                        f"✅ Your inactivity request (from {start_date_str} to {end_date_str}) was approved."
                     )
                 except discord.Forbidden:
                     pass
-        else:
-            # The user left => remove them from the DB
-            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id,))
-            conn.commit()
-            if origin_channel:
-                await origin_channel.send(
-                    f"❌ We could not find that user in the server; removed them from the DB."
-                )
             else:
+                # If user left, remove from DB or skip
+                cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id,))
+                conn.commit()
+        else:
+            # Denied => do nothing in DB
+            member = reaction.message.guild.get_member(request_user_id)
+            if member:
                 try:
-                    await user.send("❌ Could not find your Member record. Removed from DB.")
+                    await member.send("❌ Your inactivity request has been denied.")
                 except discord.Forbidden:
                     pass
-
-    elif str(reaction.emoji) == "❌":
-        # Denied
-        if origin_channel:
-            await origin_channel.send(f"❌ <@{flight_user_id}>, your flight log has been denied.")
-        else:
-            try:
-                await user.send("❌ Your flight log has been denied.")
-            except discord.Forbidden:
-                pass
-
-    # Remove from pending logs
-    del pending_flight_logs[msg_id]
+        
+        # Remove from pending requests
+        del pending_inactivity_requests[msg_id]
 
 # --------------------------------------------------------------------
 # RUN THE BOT
