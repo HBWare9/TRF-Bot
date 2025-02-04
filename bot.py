@@ -555,7 +555,7 @@ async def report_quota(ctx):
     If a user left the server, remove them from DB instead of listing them.
     """
     recalculate_quota()
-    cursor.execute("SELECT DiscordID FROM Users WHERE QuotaMet=false")
+    cursor.execute("SELECT DiscordID FROM Users WHERE QuotaMet=false AND Inactive=false")
     rows = cursor.fetchall()
 
     if not rows:
@@ -1084,6 +1084,66 @@ async def end_inactivity(ctx, user: discord.Member):
     conn.commit()
     
     await ctx.send(f"✅ {user.mention} is now marked as active.")
+
+    @bot.command(name="display_inactivity")
+    @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+    async def display_inactivity(ctx):
+        """
+        Displays all users who are currently marked as inactive, along with their start date, end date, and reason.
+        """
+        cursor.execute("""
+            SELECT DiscordID, InactiveStart, InactiveEnd, InactiveReason
+            FROM Users
+            WHERE Inactive = TRUE
+        """)
+        rows = cursor.fetchall()
+
+        if not rows:
+            embed = discord.Embed(
+                title="Inactivity Report",
+                description="No users are currently marked as inactive.",
+                color=discord.Color.green()
+            )
+            await ctx.send(embed=embed)
+            return
+
+        lines = []
+        for disc_id_str, start_date, end_date, reason in rows:
+            if disc_id_str.isdigit():
+                member = ctx.guild.get_member(int(disc_id_str))
+                if member:
+                    lines.append(
+                        f"• {member.mention}\n"
+                        f"  **Start Date:** {start_date}\n"
+                        f"  **End Date:** {end_date}\n"
+                        f"  **Reason:** {reason}\n"
+                    )
+                else:
+                    # User left the server, remove from DB
+                    cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+                    conn.commit()
+
+        if not lines:
+            embed = discord.Embed(
+                title="Inactivity Report",
+                description="No users are currently marked as inactive.",
+                color=discord.Color.green()
+            )
+            await ctx.send(embed=embed)
+            return
+
+        def chunk_string(txt, limit=1800):
+            return [txt[i : i + limit] for i in range(0, len(txt), limit)]
+
+        big_text = "\n".join(lines)
+        chunks = chunk_string(big_text)
+        for i, chunk in enumerate(chunks, start=1):
+            embed = discord.Embed(
+                title=f"Inactivity Report (Page {i}/{len(chunks)})",
+                description=chunk,
+                color=discord.Color.orange()
+            )
+            await ctx.send(embed=embed)
 
 # --------------------------------------------------------------------
 # EVENTS
