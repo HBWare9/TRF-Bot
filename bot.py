@@ -812,22 +812,26 @@ async def test(ctx):
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def update_ranks(ctx):
     """
-    Go through the DB, find each user, and update 'Rank' based on their highest qualifying role.
+    Go through the DB, find each user, and update 'Rank' and 'r_user' based on their highest qualifying role.
     If the user has left, remove them from the DB.
     """
-    cursor.execute("SELECT DiscordID FROM Users")
+    cursor.execute("SELECT DiscordID, RobloxID FROM Users")
     all_users = cursor.fetchall()
 
     updated_count = 0
     removed_count = 0
     await ctx.guild.chunk()
 
-    for (disc_id_str,) in all_users:
+    for disc_id_str, roblox_id in all_users:
         if disc_id_str.isdigit():
             member = ctx.guild.get_member(int(disc_id_str))
             if member:
                 rank = get_highest_qualifying_role(member, ctx.guild) or "Unknown"
-                cursor.execute("UPDATE Users SET Rank=%s WHERE DiscordID=%s", (rank, disc_id_str))
+                roblox_username = fetch_latest_roblox_username(roblox_id)
+                cursor.execute(
+                    "UPDATE Users SET Rank=%s, r_user=%s WHERE DiscordID=%s",
+                    (rank, roblox_username, disc_id_str)
+                )
                 updated_count += 1
             else:
                 # remove from DB
@@ -839,7 +843,7 @@ async def update_ranks(ctx):
             removed_count += 1
 
     conn.commit()
-    await ctx.send(f"✅ Updated ranks for {updated_count} users. Removed {removed_count} who left.")
+    await ctx.send(f"✅ Updated ranks and usernames for {updated_count} users. Removed {removed_count} who left.")
 
 # --------------------------------------------------------------------
 # 1) Everyone can use !commands
