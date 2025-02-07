@@ -67,7 +67,7 @@ if not BOT_TOKEN:
 # Roles and IDs
 # --------------------------------------------------------------------
 allowed_role_ids = {
-    830563690901929994,
+    830563690901929994,  # Insert your relevant role IDs
     830563690096754709,
     830563689618079814,
     948638117299118170,
@@ -182,7 +182,7 @@ def ensure_user_record(member: discord.Member, guild: discord.Guild):
     if row:
         existing_roblox_id, existing_user_name = row
         if existing_roblox_id:
-            # Already have a Roblox ID or fallback, just update their rank
+            # Already have a Roblox ID or fallback; update their rank if needed
             rank = get_highest_qualifying_role(member, guild) or "Unknown"
             cursor.execute("UPDATE Users SET Rank=%s WHERE DiscordID=%s", (rank, discord_id_str))
             conn.commit()
@@ -282,6 +282,9 @@ async def log_flight(ctx):
     except ValueError:
         await ctx.send("❌ Please enter a valid number of minutes.")
         return
+
+    # Ensure the user is in the DB right away
+    ensure_user_record(ctx.author, ctx.guild)
 
     # Step 2: screenshot prompt
     await ctx.send("📸 Please provide a screenshot of your flight time.")
@@ -485,7 +488,7 @@ async def log_event(ctx):
     recalculate_quota()
 
     # Final summary
-    final_channel = bot.get_channel(830596103434534932)
+    final_channel = bot.get_channel(830596103434534932)  # Replace with your final summary channel if desired
     if final_channel is None:
         final_channel = ctx.channel
 
@@ -620,7 +623,8 @@ async def check_quota(ctx):
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def add_qualified_members(ctx):
     """
-    For each member in the server who has a qualifying role, ensure they're in the DB.
+    For each member in the server who has a qualifying role, ensure they're in the DB
+    if they're missing. Does NOT ping or list those already in the DB; only a summary.
     """
     added_count = 0
     await ctx.guild.chunk()
@@ -700,6 +704,7 @@ async def log_all_members(ctx):
             old_row = cursor.fetchone()
 
             roblox_id, roblox_name = ensure_user_record(member, ctx.guild)
+            # If they didn't exist or had a fallback, this updated them.
             if not old_row or not old_row[0] or old_row[0].startswith("DISCORD-"):
                 updated_count += 1
                 await ctx.send(
@@ -988,7 +993,7 @@ async def request_inactivity(ctx):
         return
     
     start_date_str = start_msg.content.strip()
-    # Optionally validate the format
+    # Validate the format
     try:
         time.strptime(start_date_str, "%Y-%m-%d")
     except ValueError:
@@ -1055,9 +1060,6 @@ async def request_inactivity(ctx):
     
     await ctx.send("✅ Your inactivity request has been submitted for approval.")
 
-# --------------------------------------------------------------------
-# Optional Command: end_inactivity
-# --------------------------------------------------------------------
 @bot.command(name="end_inactivity")
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def end_inactivity(ctx, user: discord.Member):
@@ -1085,65 +1087,66 @@ async def end_inactivity(ctx, user: discord.Member):
     
     await ctx.send(f"✅ {user.mention} is now marked as active.")
 
-    @bot.command(name="display_inactivity")
-    @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
-    async def display_inactivity(ctx):
-        """
-        Displays all users who are currently marked as inactive, along with their start date, end date, and reason.
-        """
-        cursor.execute("""
-            SELECT DiscordID, InactiveStart, InactiveEnd, InactiveReason
-            FROM Users
-            WHERE Inactive = TRUE
-        """)
-        rows = cursor.fetchall()
+@bot.command(name="display_inactivity")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def display_inactivity(ctx):
+    """
+    Displays all users who are currently marked as inactive, along with their start date, end date, and reason.
+    """
+    cursor.execute("""
+        SELECT DiscordID, InactiveStart, InactiveEnd, InactiveReason
+        FROM Users
+        WHERE Inactive = TRUE
+    """)
+    rows = cursor.fetchall()
 
-        if not rows:
-            embed = discord.Embed(
-                title="Inactivity Report",
-                description="No users are currently marked as inactive.",
-                color=discord.Color.green()
-            )
-            await ctx.send(embed=embed)
-            return
+    if not rows:
+        embed = discord.Embed(
+            title="Inactivity Report",
+            description="No users are currently marked as inactive.",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        return
 
-        lines = []
-        for disc_id_str, start_date, end_date, reason in rows:
-            if disc_id_str.isdigit():
-                member = ctx.guild.get_member(int(disc_id_str))
-                if member:
-                    lines.append(
-                        f"• {member.mention}\n"
-                        f"  **Start Date:** {start_date}\n"
-                        f"  **End Date:** {end_date}\n"
-                        f"  **Reason:** {reason}\n"
-                    )
-                else:
-                    # User left the server, remove from DB
-                    cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
-                    conn.commit()
+    lines = []
+    for disc_id_str, start_date, end_date, reason in rows:
+        if disc_id_str.isdigit():
+            member = ctx.guild.get_member(int(disc_id_str))
+            if member:
+                lines.append(
+                    f"• {member.mention}\n"
+                    f"  **Start Date:** {start_date}\n"
+                    f"  **End Date:** {end_date}\n"
+                    f"  **Reason:** {reason}\n"
+                )
+            else:
+                # User left the server, remove from DB
+                cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+                conn.commit()
 
-        if not lines:
-            embed = discord.Embed(
-                title="Inactivity Report",
-                description="No users are currently marked as inactive.",
-                color=discord.Color.green()
-            )
-            await ctx.send(embed=embed)
-            return
+    # After cleanup, re-check if we still have lines:
+    if not lines:
+        embed = discord.Embed(
+            title="Inactivity Report",
+            description="No users are currently marked as inactive.",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        return
 
-        def chunk_string(txt, limit=1800):
-            return [txt[i : i + limit] for i in range(0, len(txt), limit)]
+    def chunk_string(txt, limit=1800):
+        return [txt[i : i + limit] for i in range(0, len(txt), limit)]
 
-        big_text = "\n".join(lines)
-        chunks = chunk_string(big_text)
-        for i, chunk in enumerate(chunks, start=1):
-            embed = discord.Embed(
-                title=f"Inactivity Report (Page {i}/{len(chunks)})",
-                description=chunk,
-                color=discord.Color.orange()
-            )
-            await ctx.send(embed=embed)
+    big_text = "\n".join(lines)
+    chunks = chunk_string(big_text)
+    for i, chunk in enumerate(chunks, start=1):
+        embed = discord.Embed(
+            title=f"Inactivity Report (Page {i}/{len(chunks)})",
+            description=chunk,
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed)
 
 # --------------------------------------------------------------------
 # EVENTS
@@ -1249,7 +1252,7 @@ async def on_reaction_add(reaction, user):
                 except discord.Forbidden:
                     pass
             else:
-                # If user left, remove from DB or skip
+                # If user left, remove from DB
                 cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id,))
                 conn.commit()
         else:
