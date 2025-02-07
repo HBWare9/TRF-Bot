@@ -122,6 +122,10 @@ def get_highest_qualifying_role(member: discord.Member, guild: discord.Guild):
 # Roblox + RoVer Helpers
 # --------------------------------------------------------------------
 def fetch_latest_roblox_username(roblox_id):
+    """
+    Fetch the current username for a given Roblox ID.
+    If the ID is invalid or the request fails, return "Unknown".
+    """
     url = f"https://users.roblox.com/v1/users/{roblox_id}"
     try:
         response = requests.get(url)
@@ -374,7 +378,7 @@ async def log_event(ctx):
     # Collect attendees
     attendees_input = []
     await ctx.send(
-        "**Enter each attendee one by one** (Mention with @[DISCORD USERNAME]).\n"
+        "**Enter each attendee one by one** (Mention with @[DISCORD USER]).\n"
         "Type **`done`** when finished. You have 60 seconds per entry."
     )
     while True:
@@ -812,25 +816,29 @@ async def test(ctx):
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def update_ranks(ctx):
     """
-    Go through the DB, find each user, and update 'Rank' and 'r_user' based on their highest qualifying role.
-    If the user has left, remove them from the DB.
+    Go through the DB:
+      - If the user is still in the server, update:
+          Rank => highest qualifying role
+          r_user => their current Discord display name
+      - If the user left or DiscordID not numeric, remove them from the DB.
     """
-    cursor.execute("SELECT DiscordID, RobloxID FROM Users")
+    cursor.execute("SELECT DiscordID FROM Users")
     all_users = cursor.fetchall()
 
     updated_count = 0
     removed_count = 0
     await ctx.guild.chunk()
 
-    for disc_id_str, roblox_id in all_users:
+    for (disc_id_str,) in all_users:
         if disc_id_str.isdigit():
             member = ctx.guild.get_member(int(disc_id_str))
             if member:
                 rank = get_highest_qualifying_role(member, ctx.guild) or "Unknown"
-                roblox_username = fetch_latest_roblox_username(roblox_id)
+                # Set r_user to the member's current display name in this server
+                new_r_user = member.display_name
                 cursor.execute(
                     "UPDATE Users SET Rank=%s, r_user=%s WHERE DiscordID=%s",
-                    (rank, roblox_username, disc_id_str)
+                    (rank, new_r_user, disc_id_str)
                 )
                 updated_count += 1
             else:
@@ -843,7 +851,10 @@ async def update_ranks(ctx):
             removed_count += 1
 
     conn.commit()
-    await ctx.send(f"✅ Updated ranks and usernames for {updated_count} users. Removed {removed_count} who left.")
+    await ctx.send(
+        f"✅ Updated rank + display names for {updated_count} users. "
+        f"Removed {removed_count} who left or had invalid IDs."
+    )
 
 # --------------------------------------------------------------------
 # 1) Everyone can use !commands
