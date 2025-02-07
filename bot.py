@@ -374,7 +374,7 @@ async def log_event(ctx):
     # Collect attendees
     attendees_input = []
     await ctx.send(
-        "**Enter each attendee one by one** (mention OR numeric Roblox ID).\n"
+        "**Enter each attendee one by one** (Mention with @[DISCORD USERNAME]).\n"
         "Type **`done`** when finished. You have 60 seconds per entry."
     )
     while True:
