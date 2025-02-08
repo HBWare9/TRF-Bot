@@ -1102,6 +1102,30 @@ async def end_inactivity(ctx, user: discord.Member):
     
     await ctx.send(f"✅ {user.mention} is now marked as active.")
 
+@bot.command(name="manual_log")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def manual_log(ctx, user: discord.Member):
+    """
+    Usage: !manual_log @Member
+    Manually adds 1 event log to a user's record in the database.
+    """
+    disc_id_str = str(user.id)
+    cursor.execute("SELECT DiscordID FROM Users WHERE DiscordID=%s", (disc_id_str,))
+    row = cursor.fetchone()
+
+    if not row:
+        await ctx.send(f"No database record found for {user.mention}.")
+        return
+
+    cursor.execute("""
+        UPDATE Users
+        SET EventsAttended = EventsAttended + 1
+        WHERE DiscordID=%s
+    """, (disc_id_str,))
+    conn.commit()
+
+    await ctx.send(f"✅ 1 event log has been manually added to {user.mention}'s record.")
+
 @bot.command(name="display_inactivity")
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def display_inactivity(ctx):
