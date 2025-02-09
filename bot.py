@@ -1007,6 +1007,23 @@ async def enforce_quota(ctx):
     await ctx.send(embed=embed)
 
 
+@bot.command(name="reset_strikes")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def reset_strikes(ctx):
+    """
+    Usage: !reset_strikes
+    Resets EVERYONE's strikes in the DB to 0.
+    """
+    cursor.execute(
+        """
+        UPDATE Users
+        SET Strikes=0
+        """
+    )
+    conn.commit()
+    await ctx.send("✅ All users' strikes have been reset to 0.")
+
+
 @bot.command(name="check_failed")
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def check_failed(ctx):
