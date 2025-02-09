@@ -19,7 +19,7 @@ if not DATABASE_URL:
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
 
-# Ensure the Users table exists. We'll store quota as BOOLEAN in Postgres.
+# Ensure the Users table exists
 cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS Users (
@@ -36,14 +36,25 @@ cursor.execute(
 )
 conn.commit()
 
-# Now, add columns for inactivity if they don't exist.
-cursor.execute("""
+# Add columns for inactivity if they don't exist
+cursor.execute(
+    """
     ALTER TABLE Users
     ADD COLUMN IF NOT EXISTS Inactive BOOLEAN DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS InactiveStart DATE,
     ADD COLUMN IF NOT EXISTS InactiveEnd DATE,
     ADD COLUMN IF NOT EXISTS InactiveReason TEXT;
-""")
+    """
+)
+conn.commit()
+
+# Add Strikes column (integer) if it doesn't exist
+cursor.execute(
+    """
+    ALTER TABLE Users
+    ADD COLUMN IF NOT EXISTS Strikes INTEGER DEFAULT 0;
+    """
+)
 conn.commit()
 
 # --------------------------------------------------------------------
@@ -86,17 +97,27 @@ qualifying_role_ids = [
     948638117299118170,
 ]
 
+# Required role to use certain commands
 REQUIRED_ROLE_ID_FOR_OTHERS = 830563689618079814
+
+# Channel IDs
 REVIEW_CHANNEL_ID = 897184372027969576
+INACTIVITY_APPROVAL_CHANNEL_ID = 897184372027969576  # Replace if you have a separate channel
 
-# NEW: Inactivity approval channel
-INACTIVITY_APPROVAL_CHANNEL_ID = 897184372027969576  # Replace with your actual channel ID
-
-# For storing flight logs awaiting approval
+# Flight logs pending approval
 pending_flight_logs = {}  # message_id -> { user_id, minutes, origin_channel_id }
 
-# For storing inactivity requests awaiting approval
+# Inactivity requests pending approval
 pending_inactivity_requests = {}  # message_id -> { user_id, start_date, end_date, reason }
+
+# Exempt roles from strikes (i.e. do not penalize them in !enforce_quota)
+exempt_role_ids = {
+    830563689618079814,  # e.g. "HC"
+    948638117299118170,  # example
+    830563688918155314,  # example
+    897190724297195580,  # example
+    830563688179826738,  # example
+}
 
 # --------------------------------------------------------------------
 # Permission helpers
@@ -217,8 +238,8 @@ def ensure_user_record(member: discord.Member, guild: discord.Guild):
             """
             INSERT INTO Users (DiscordID, RobloxID, r_user,
                                EventsAttended, EventsHosted,
-                               FlightMinutes, QuotaMet, Rank)
-            VALUES (%s, %s, %s, 0, 0, 0, FALSE, %s)
+                               FlightMinutes, QuotaMet, Rank, Strikes)
+            VALUES (%s, %s, %s, 0, 0, 0, FALSE, %s, 0)
             """,
             (discord_id_str, fetched_id, fetched_name, rank)
         )
@@ -422,7 +443,7 @@ async def log_event(ctx):
         mention_list = attendee_msg.mentions
 
         if mention_list:
-            # Attendee was a mention (a Discord user in this server)
+            # Attendee was a mention
             attendee_member = mention_list[0]
             ensure_user_record(attendee_member, ctx.guild)
             cursor.execute(
@@ -442,7 +463,7 @@ async def log_event(ctx):
             row = cursor.fetchone()
 
             if row:
-                # Already in the DB with some DiscordID
+                # Already in the DB
                 cursor.execute(
                     "UPDATE Users SET EventsAttended=EventsAttended+1 WHERE RobloxID=%s",
                     (roblox_id,)
@@ -450,12 +471,12 @@ async def log_event(ctx):
                 conn.commit()
                 attendees_processed.append(str(row[0]))
             else:
-                # Create a new record with DiscordID='0' since we don't know their real Discord ID
+                # Create new record with DiscordID='0'
                 cursor.execute(
                     """
                     INSERT INTO Users (DiscordID, RobloxID, r_user, EventsAttended, EventsHosted,
-                                       FlightMinutes, QuotaMet, Rank)
-                    VALUES (%s, %s, %s, 1, 0, 0, FALSE, %s)
+                                       FlightMinutes, QuotaMet, Rank, Strikes)
+                    VALUES (%s, %s, %s, 1, 0, 0, FALSE, %s, 0)
                     """,
                     ("0", roblox_id, roblox_username, "Unknown")
                 )
@@ -492,7 +513,7 @@ async def log_event(ctx):
     recalculate_quota()
 
     # Final summary
-    final_channel = bot.get_channel(830596103434534932)  # Replace with your final summary channel if desired
+    final_channel = bot.get_channel(830596103434534932)  # or use ctx.channel if you prefer
     if final_channel is None:
         final_channel = ctx.channel
 
@@ -529,11 +550,14 @@ async def manual_log(ctx, user: discord.Member):
         await ctx.send(f"No database record found for {user.mention}.")
         return
 
-    cursor.execute("""
+    cursor.execute(
+        """
         UPDATE Users
         SET EventsAttended = EventsAttended + 1
         WHERE DiscordID=%s
-    """, (disc_id_str,))
+        """,
+        (disc_id_str,)
+    )
     conn.commit()
 
     await ctx.send(f"✅ 1 event log has been manually added to {user.mention}'s record.")
@@ -569,8 +593,8 @@ async def register(ctx, roblox_id: str):
             """
             INSERT INTO Users (DiscordID, RobloxID, r_user,
                                EventsAttended, EventsHosted,
-                               FlightMinutes, QuotaMet, Rank)
-            VALUES (%s, %s, %s, 0, 0, 0, FALSE, %s)
+                               FlightMinutes, QuotaMet, Rank, Strikes)
+            VALUES (%s, %s, %s, 0, 0, 0, FALSE, %s, 0)
             """,
             (discord_id, roblox_id, latest_username, rank)
         )
@@ -735,7 +759,6 @@ async def log_all_members(ctx):
             old_row = cursor.fetchone()
 
             roblox_id, roblox_name = ensure_user_record(member, ctx.guild)
-            # If they didn't exist or had a fallback, this updated them.
             if not old_row or not old_row[0] or old_row[0].startswith("DISCORD-"):
                 updated_count += 1
                 await ctx.send(
@@ -861,7 +884,7 @@ async def update_ranks(ctx):
             member = ctx.guild.get_member(int(disc_id_str))
             if member:
                 rank = get_highest_qualifying_role(member, ctx.guild) or "Unknown"
-                # Set r_user to the member's current display name in this server
+                # Set r_user to the member's current display name
                 new_r_user = member.display_name
                 cursor.execute(
                     "UPDATE Users SET Rank=%s, r_user=%s WHERE DiscordID=%s",
@@ -869,11 +892,9 @@ async def update_ranks(ctx):
                 )
                 updated_count += 1
             else:
-                # remove from DB
                 cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
                 removed_count += 1
         else:
-            # also remove if not numeric
             cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
             removed_count += 1
 
@@ -882,6 +903,141 @@ async def update_ranks(ctx):
         f"✅ Updated rank + display names for {updated_count} users. "
         f"Removed {removed_count} who left or had invalid IDs."
     )
+
+# --------------------------------------------------------------------
+# New Commands: !enforce_quota and !check_failed
+# --------------------------------------------------------------------
+
+@bot.command(name="enforce_quota")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def enforce_quota(ctx):
+    """
+    1) Recalculates quota
+    2) Finds all users who have NOT met the quota, are NOT on inactivity,
+       and do NOT have an exempt role (in exempt_role_ids).
+    3) Adds 1 Strike to each of those users.
+    4) Sends a message listing all members who received a strike.
+       - Removes from DB any user who left the server or has invalid DiscordID.
+    """
+    recalculate_quota()
+    cursor.execute(
+        """
+        SELECT DiscordID
+        FROM Users
+        WHERE QuotaMet = FALSE
+          AND Inactive = FALSE
+        """
+    )
+    rows = cursor.fetchall()
+
+    striked_members = []
+    removed_count = 0
+
+    await ctx.guild.chunk()
+
+    for (disc_id_str,) in rows:
+        # Skip if not numeric
+        if not disc_id_str.isdigit():
+            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+            conn.commit()
+            removed_count += 1
+            continue
+
+        member = ctx.guild.get_member(int(disc_id_str))
+        if not member:
+            # user left => remove from DB
+            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+            conn.commit()
+            removed_count += 1
+            continue
+
+        # Check exempt roles
+        if any(role.id in exempt_role_ids for role in member.roles):
+            continue
+
+        # Add 1 strike
+        cursor.execute("UPDATE Users SET Strikes = Strikes + 1 WHERE DiscordID=%s", (disc_id_str,))
+        conn.commit()
+        striked_members.append(member.mention)
+
+    if striked_members:
+        embed = discord.Embed(
+            title="Enforce Quota",
+            description="The following users have been given **1 Strike** for failing to meet quota:",
+            color=discord.Color.red()
+        )
+        embed.add_field(
+            name="Striked Users",
+            value="\n".join(striked_members),
+            inline=False
+        )
+        if removed_count > 0:
+            embed.set_footer(text=f"Also removed {removed_count} user(s) who left or had invalid IDs.")
+        await ctx.send(embed=embed)
+    else:
+        # Possibly no one was striked
+        msg = "No users were striked (either no one failed quota or all failing were exempt/inactive)."
+        if removed_count > 0:
+            msg += f"\nRemoved {removed_count} user(s) who left or had invalid IDs."
+        await ctx.send(msg)
+
+@bot.command(name="check_failed")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def check_failed(ctx):
+    """
+    Shows all users who have 2 or more strikes.
+    Removes from DB those who left or have invalid ID.
+    """
+    cursor.execute("SELECT DiscordID, Strikes FROM Users WHERE Strikes >= 2")
+    rows = cursor.fetchall()
+
+    if not rows:
+        await ctx.send("No users currently have 2 or more strikes.")
+        return
+
+    lines = []
+    removed_count = 0
+    await ctx.guild.chunk()
+
+    for (disc_id_str, strikes) in rows:
+        if not disc_id_str.isdigit():
+            # remove
+            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+            conn.commit()
+            removed_count += 1
+            continue
+
+        member = ctx.guild.get_member(int(disc_id_str))
+        if not member:
+            # remove
+            cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+            conn.commit()
+            removed_count += 1
+            continue
+
+        lines.append(f"• {member.mention} has **{strikes}** strike(s).")
+
+    if not lines:
+        msg = "No valid users with 2+ strikes in the database."
+        if removed_count > 0:
+            msg += f" Removed {removed_count} invalid entries."
+        await ctx.send(msg)
+        return
+
+    def chunk_string(txt, limit=1800):
+        return [txt[i : i + limit] for i in range(0, len(txt), limit)]
+
+    big_str = "\n".join(lines)
+    chunks = chunk_string(big_str)
+    for i, chunk in enumerate(chunks, 1):
+        embed = discord.Embed(
+            title=f"Users with 2+ Strikes (Page {i}/{len(chunks)})",
+            description=chunk,
+            color=discord.Color.red()
+        )
+        if removed_count > 0 and i == 1:
+            embed.set_footer(text=f"Removed {removed_count} invalid user(s).")
+        await ctx.send(embed=embed)
 
 # --------------------------------------------------------------------
 # 1) Everyone can use !commands
@@ -919,7 +1075,7 @@ async def lookup(ctx, user: discord.Member):
     disc_id_str = str(user.id)
     cursor.execute(
         """
-        SELECT RobloxID, r_user, EventsAttended, EventsHosted, FlightMinutes, QuotaMet
+        SELECT RobloxID, r_user, EventsAttended, EventsHosted, FlightMinutes, QuotaMet, Strikes
         FROM Users
         WHERE DiscordID=%s
         """,
@@ -931,7 +1087,7 @@ async def lookup(ctx, user: discord.Member):
         await ctx.send(f"No database entry found for {user.mention}.")
         return
 
-    roblox_id, r_user_val, attended, hosted, flight_mins, quota_met = row
+    roblox_id, r_user_val, attended, hosted, flight_mins, quota_met, strikes = row
     attended = attended or 0
     hosted = hosted or 0
     flight_mins = flight_mins or 0
@@ -948,6 +1104,7 @@ async def lookup(ctx, user: discord.Member):
     embed.add_field(name="Events Hosted", value=str(hosted), inline=True)
     embed.add_field(name="Flight Minutes", value=str(flight_mins), inline=True)
     embed.add_field(name="Quota Complete", value=quota_str, inline=True)
+    embed.add_field(name="Strikes", value=str(strikes or 0), inline=True)
 
     await ctx.send(embed=embed)
 
@@ -960,7 +1117,8 @@ async def wipe_user(ctx, user: discord.Member):
     """
     Usage: !wipe_user @Member
     Resets a single user's counters: EventsAttended=0, EventsHosted=0,
-    FlightMinutes=0, QuotaMet=FALSE. Keeps RobloxID, r_user, Rank intact.
+    FlightMinutes=0, QuotaMet=FALSE, Strikes=0.
+    Keeps RobloxID, r_user, Rank, etc. intact.
     """
     disc_id_str = str(user.id)
     # Check if user exists in DB
@@ -977,7 +1135,8 @@ async def wipe_user(ctx, user: discord.Member):
         SET EventsAttended=0,
             EventsHosted=0,
             FlightMinutes=0,
-            QuotaMet=FALSE
+            QuotaMet=FALSE,
+            Strikes=0
         WHERE DiscordID=%s
         """,
         (disc_id_str,)
@@ -998,6 +1157,7 @@ async def reset_quota_command(ctx):
     - EventsHosted = 0
     - FlightMinutes = 0
     - QuotaMet = FALSE
+    - Strikes = 0
     """
     cursor.execute(
         """
@@ -1005,11 +1165,12 @@ async def reset_quota_command(ctx):
         SET EventsAttended=0,
             EventsHosted=0,
             FlightMinutes=0,
-            QuotaMet=FALSE
+            QuotaMet=FALSE,
+            Strikes=0
         """
     )
     conn.commit()
-    await ctx.send("✅ All users' counters have been reset to 0, and QuotaMet set to False.")
+    await ctx.send("✅ All users' counters have been reset to 0, and QuotaMet set to False, Strikes=0.")
 
 # --------------------------------------------------------------------
 # NEW COMMAND: !request_inactivity
@@ -1025,7 +1186,7 @@ async def request_inactivity(ctx):
     """
     def check_author(m):
         return (m.author == ctx.author and m.channel == ctx.channel)
-    
+
     # Step 1: Ask for start date
     await ctx.send("📅 Please provide your **start date** for inactivity (YYYY-MM-DD). You have 60s.")
     try:
@@ -1033,15 +1194,15 @@ async def request_inactivity(ctx):
     except asyncio.TimeoutError:
         await ctx.send("❌ You took too long. Inactivity request cancelled.")
         return
-    
+
     start_date_str = start_msg.content.strip()
-    # Validate the format
+    # Validate format
     try:
         time.strptime(start_date_str, "%Y-%m-%d")
     except ValueError:
         await ctx.send("❌ Invalid date format. Use YYYY-MM-DD. Request cancelled.")
         return
-    
+
     # Step 2: Ask for end date
     await ctx.send("📅 Please provide your **end date** for inactivity (YYYY-MM-DD). You have 60s.")
     try:
@@ -1049,33 +1210,33 @@ async def request_inactivity(ctx):
     except asyncio.TimeoutError:
         await ctx.send("❌ You took too long. Inactivity request cancelled.")
         return
-    
+
     end_date_str = end_msg.content.strip()
     try:
         time.strptime(end_date_str, "%Y-%m-%d")
     except ValueError:
         await ctx.send("❌ Invalid date format. Use YYYY-MM-DD. Request cancelled.")
         return
-    
-    # Step 3: Reason for inactivity
+
+    # Step 3: Reason
     await ctx.send("✏️ Please provide the **reason** for your inactivity. You have 120s.")
     try:
         reason_msg = await bot.wait_for("message", timeout=120.0, check=check_author)
     except asyncio.TimeoutError:
         await ctx.send("❌ You took too long. Inactivity request cancelled.")
         return
-    
+
     reason = reason_msg.content.strip()
     if not reason:
         await ctx.send("❌ No reason provided. Request cancelled.")
         return
-    
-    # Step 4: Post to the inactivity approval channel
+
+    # Step 4: Post to inactivity approval channel
     inactivity_channel = bot.get_channel(INACTIVITY_APPROVAL_CHANNEL_ID)
     if not inactivity_channel:
         await ctx.send("❌ Could not find the inactivity approval channel. Contact an admin.")
         return
-    
+
     embed = discord.Embed(
         title="Inactivity Request",
         color=discord.Color.orange(),
@@ -1091,15 +1252,14 @@ async def request_inactivity(ctx):
     approval_message = await inactivity_channel.send(embed=embed)
     await approval_message.add_reaction("✅")
     await approval_message.add_reaction("❌")
-    
-    # Store this request in the pending dict
+
     pending_inactivity_requests[approval_message.id] = {
         "user_id": ctx.author.id,
         "start_date": start_date_str,
         "end_date": end_date_str,
         "reason": reason
     }
-    
+
     await ctx.send("✅ Your inactivity request has been submitted for approval.")
 
 @bot.command(name="end_inactivity")
@@ -1112,21 +1272,24 @@ async def end_inactivity(ctx, user: discord.Member):
     disc_id_str = str(user.id)
     cursor.execute("SELECT DiscordID FROM Users WHERE DiscordID=%s", (disc_id_str,))
     row = cursor.fetchone()
-    
+
     if not row:
         await ctx.send(f"No database record found for {user.mention}.")
         return
-    
-    cursor.execute("""
+
+    cursor.execute(
+        """
         UPDATE Users
         SET Inactive=FALSE,
             InactiveStart=NULL,
             InactiveEnd=NULL,
             InactiveReason=NULL
         WHERE DiscordID=%s
-    """, (disc_id_str,))
+        """,
+        (disc_id_str,)
+    )
     conn.commit()
-    
+
     await ctx.send(f"✅ {user.mention} is now marked as active.")
 
 @bot.command(name="display_inactivity")
@@ -1135,11 +1298,13 @@ async def display_inactivity(ctx):
     """
     Displays all users who are currently marked as inactive, along with their start date, end date, and reason.
     """
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT DiscordID, InactiveStart, InactiveEnd, InactiveReason
         FROM Users
         WHERE Inactive = TRUE
-    """)
+        """
+    )
     rows = cursor.fetchall()
 
     if not rows:
@@ -1163,11 +1328,11 @@ async def display_inactivity(ctx):
                     f"  **Reason:** {reason}\n"
                 )
             else:
-                # User left the server, remove from DB
+                # user left the server, remove from DB
                 cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
                 conn.commit()
 
-    # After cleanup, re-check if we still have lines:
+    # After cleanup, re-check
     if not lines:
         embed = discord.Embed(
             title="Inactivity Report",
@@ -1203,14 +1368,13 @@ async def on_reaction_add(reaction, user):
     if user.bot:
         return
 
-    # We allow:
-    #  - Flight log approvals in REVIEW_CHANNEL_ID
-    #  - Inactivity requests in INACTIVITY_APPROVAL_CHANNEL_ID
+    # We allow flight log approvals in REVIEW_CHANNEL_ID
+    # and inactivity requests in INACTIVITY_APPROVAL_CHANNEL_ID
     if reaction.message.channel.id not in [REVIEW_CHANNEL_ID, INACTIVITY_APPROVAL_CHANNEL_ID]:
         return
 
     msg_id = reaction.message.id
-    
+
     # 1) Check if it's a flight log
     if msg_id in pending_flight_logs:
         flight_log = pending_flight_logs[msg_id]
@@ -1261,7 +1425,7 @@ async def on_reaction_add(reaction, user):
     elif msg_id in pending_inactivity_requests:
         if str(reaction.emoji) not in ["✅", "❌"]:
             return
-        
+
         inactivity_request = pending_inactivity_requests[msg_id]
         request_user_id = inactivity_request["user_id"]
         start_date_str = inactivity_request["start_date"]
@@ -1305,7 +1469,7 @@ async def on_reaction_add(reaction, user):
                     await member.send("❌ Your inactivity request has been denied.")
                 except discord.Forbidden:
                     pass
-        
+
         # Remove from pending requests
         del pending_inactivity_requests[msg_id]
 
