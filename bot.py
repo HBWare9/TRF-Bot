@@ -960,26 +960,52 @@ async def enforce_quota(ctx):
         conn.commit()
         striked_members.append(member.mention)
 
-    if striked_members:
-        embed = discord.Embed(
-            title="Enforce Quota",
-            description="The following users have been given **1 Strike** for failing to meet quota:",
-            color=discord.Color.red()
-        )
-        embed.add_field(
-            name="Striked Users",
-            value="\n".join(striked_members),
-            inline=False
-        )
-        if removed_count > 0:
-            embed.set_footer(text=f"Also removed {removed_count} user(s) who left or had invalid IDs.")
-        await ctx.send(embed=embed)
-    else:
-        # Possibly no one was striked
+    # If no one was striked, send a simple message
+    if not striked_members:
         msg = "No users were striked (either no one failed quota or all failing were exempt/inactive)."
         if removed_count > 0:
             msg += f"\nRemoved {removed_count} user(s) who left or had invalid IDs."
         await ctx.send(msg)
+        return
+
+    # Otherwise, build the embed and chunk the striked list so we don’t exceed 1024 chars in one field
+    embed = discord.Embed(
+        title="Enforce Quota",
+        description="The following users have been given **1 Strike** for failing to meet quota:",
+        color=discord.Color.red()
+    )
+
+    # Helper function: chunk a big list into lines that fit within 1024 chars
+    def chunk_lines(lines, max_length=1024):
+        """
+        Takes a list of strings (lines) and yields combined
+        strings that do not exceed max_length in total.
+        """
+        current_chunk = ""
+        for line in lines:
+            # +1 for newline
+            if len(current_chunk) + len(line) + 1 > max_length:
+                yield current_chunk
+                current_chunk = line
+            else:
+                if not current_chunk:
+                    current_chunk = line
+                else:
+                    current_chunk += "\n" + line
+        if current_chunk:
+            yield current_chunk
+
+    # Chunk the striked list (each mention is a line)
+    chunks = list(chunk_lines(striked_members))
+    # Add each chunk as its own field in the embed
+    for i, chunk in enumerate(chunks, start=1):
+        embed.add_field(name=f"Striked (Part {i})", value=chunk, inline=False)
+
+    if removed_count > 0:
+        embed.set_footer(text=f"Also removed {removed_count} user(s) who left or had invalid IDs.")
+
+    await ctx.send(embed=embed)
+
 
 @bot.command(name="check_failed")
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
