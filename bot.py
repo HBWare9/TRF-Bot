@@ -1200,7 +1200,6 @@ async def reset_quota_command(ctx):
     - EventsHosted = 0
     - FlightMinutes = 0
     - QuotaMet = FALSE
-    - Strikes = 0
     """
     cursor.execute(
         """
@@ -1208,12 +1207,11 @@ async def reset_quota_command(ctx):
         SET EventsAttended=0,
             EventsHosted=0,
             FlightMinutes=0,
-            QuotaMet=FALSE,
-            Strikes=0
+            QuotaMet=FALSE
         """
     )
     conn.commit()
-    await ctx.send("✅ All users' counters have been reset to 0, and QuotaMet set to False, Strikes=0.")
+    await ctx.send("✅ All users' counters have been reset to 0, and QuotaMet set to False.")
 
 # --------------------------------------------------------------------
 # NEW COMMAND: !request_inactivity
