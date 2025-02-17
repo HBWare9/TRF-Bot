@@ -117,6 +117,7 @@ exempt_role_ids = {
     830563688918155314,  # example
     897190724297195580,  # example
     830563688179826738,  # example
+    914638548731322419, #crimson squad
 }
 
 # --------------------------------------------------------------------
@@ -637,6 +638,9 @@ async def report_quota(ctx):
                 conn.commit()
                 removed_count += 1
             else:
+                # Check if the member has an exempt role
+                if any(role.id in exempt_role_ids for role in member.roles):
+                    continue
                 lines.append(f"• {member.mention}")
         else:
             # if DiscordID not numeric, remove
