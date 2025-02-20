@@ -255,7 +255,8 @@ def recalculate_quota():
     Recalculate ‘QuotaMet’ for all users in the database:
       - 2 events attended, OR
       - 2 events hosted, OR
-      - (1 event attended AND >= 30 flight minutes)
+      - (1 event attended AND >= 30 flight minutes), OR
+      - >= 60 flight minutes
     """
     cursor.execute("SELECT DiscordID, EventsAttended, EventsHosted, FlightMinutes FROM Users")
     rows = cursor.fetchall()
