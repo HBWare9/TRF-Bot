@@ -269,6 +269,7 @@ def recalculate_quota():
             (attended >= 2)
             or (hosted >= 2)
             or (attended >= 1 and flight_minutes >= 30)
+            or (flight_minutes >= 60)
         )
         cursor.execute("UPDATE Users SET QuotaMet=%s WHERE DiscordID=%s", (meets_quota, disc_id))
 
