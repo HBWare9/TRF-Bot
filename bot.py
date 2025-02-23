@@ -607,6 +607,36 @@ async def register(ctx, roblox_id: str):
 
     conn.commit()
 
+@bot.command(name="purge_unqualified_users")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def purge_unqualified_users(ctx):
+    """
+    Removes all users from the database who are still in the Discord server
+    but do NOT have a qualifying role.
+    """
+    cursor.execute("SELECT DiscordID FROM Users")
+    all_users = cursor.fetchall()
+
+    removed_count = 0
+    await ctx.guild.chunk()
+
+    for (disc_id_str,) in all_users:
+        if disc_id_str.isdigit():  # Ensure it's a valid Discord ID
+            member = ctx.guild.get_member(int(disc_id_str))
+            if member:
+                # Check if they have a qualifying role
+                if not has_qualifying_role(member):
+                    cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
+                    conn.commit()
+                    removed_count += 1
+
+    if removed_count == 0:
+        await ctx.send("✅ No unqualified users were found in the database.")
+    else:
+        await ctx.send(f"✅ Removed **{removed_count}** users from the database who no longer qualify.")
+
+
+
 @bot.command(name="report_quota")
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def report_quota(ctx):
