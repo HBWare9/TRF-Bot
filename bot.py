@@ -1369,6 +1369,22 @@ async def end_inactivity(ctx, user: discord.Member):
 
     await ctx.send(f"✅ {user.mention} is now marked as active.")
 
+@bot.command(name="reset_strikes")
+@require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
+async def reset_strikes(ctx):
+    """
+    Usage: !reset_strikes
+    Resets EVERYONE's strikes in the DB to 0.
+    """
+    cursor.execute(
+        """
+        UPDATE Users
+        SET Strikes=0
+        """
+    )
+    conn.commit()
+    await ctx.send("✅ All users' strikes have been reset to 0.")
+
 @bot.command(name="display_inactivity")
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def display_inactivity(ctx):
