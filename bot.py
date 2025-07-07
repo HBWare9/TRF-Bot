@@ -57,6 +57,15 @@ cursor.execute(
 )
 conn.commit()
 
+# Add ImmuneRoleStart column to track when immune role was granted
+cursor.execute(
+    """
+    ALTER TABLE Users
+    ADD COLUMN IF NOT EXISTS ImmuneRoleStart DATE;
+    """
+)
+conn.commit()
+
 # --------------------------------------------------------------------
 # Bot Setup
 # --------------------------------------------------------------------
@@ -118,7 +127,11 @@ exempt_role_ids = {
     897190724297195580,  # example
     830563688179826738,  # example
     914638548731322419, #crimson squad
+    830563693808844850,  # immune role
 }
+
+# Immune role ID for tracking
+IMMUNE_ROLE_ID = 830563693808844850
 
 # --------------------------------------------------------------------
 # Permission helpers
@@ -211,6 +224,19 @@ def ensure_user_record(member: discord.Member, guild: discord.Guild):
             # Already have a Roblox ID or fallback; update their rank if needed
             rank = get_highest_qualifying_role(member, guild) or "Unknown"
             cursor.execute("UPDATE Users SET Rank=%s WHERE DiscordID=%s", (rank, discord_id_str))
+            
+            # Check if user has immune role and track start date
+            has_immune_role = any(role.id == IMMUNE_ROLE_ID for role in member.roles)
+            cursor.execute("SELECT ImmuneRoleStart FROM Users WHERE DiscordID=%s", (discord_id_str,))
+            immune_start = cursor.fetchone()[0] if cursor.rowcount > 0 else None
+            
+            if has_immune_role and immune_start is None:
+                # User got immune role, record the date
+                cursor.execute("UPDATE Users SET ImmuneRoleStart=CURRENT_DATE WHERE DiscordID=%s", (discord_id_str,))
+            elif not has_immune_role and immune_start is not None:
+                # User lost immune role, clear the date
+                cursor.execute("UPDATE Users SET ImmuneRoleStart=NULL WHERE DiscordID=%s", (discord_id_str,))
+            
             conn.commit()
             return existing_roblox_id, existing_user_name
         else:
@@ -225,6 +251,12 @@ def ensure_user_record(member: discord.Member, guild: discord.Guild):
                 "UPDATE Users SET RobloxID=%s, r_user=%s, Rank=%s WHERE DiscordID=%s",
                 (fetched_id, fetched_name, rank, discord_id_str)
             )
+            
+            # Check if user has immune role and track start date
+            has_immune_role = any(role.id == IMMUNE_ROLE_ID for role in member.roles)
+            if has_immune_role:
+                cursor.execute("UPDATE Users SET ImmuneRoleStart=CURRENT_DATE WHERE DiscordID=%s", (discord_id_str,))
+            
             conn.commit()
             return fetched_id, fetched_name
     else:
@@ -235,12 +267,17 @@ def ensure_user_record(member: discord.Member, guild: discord.Guild):
             fetched_name = member.display_name
 
         rank = get_highest_qualifying_role(member, guild) or "Unknown"
+        
+        # Check if user has immune role
+        has_immune_role = any(role.id == IMMUNE_ROLE_ID for role in member.roles)
+        immune_start_date = "CURRENT_DATE" if has_immune_role else "NULL"
+        
         cursor.execute(
-            """
+            f"""
             INSERT INTO Users (DiscordID, RobloxID, r_user,
                                EventsAttended, EventsHosted,
-                               FlightMinutes, QuotaMet, Rank, Strikes)
-            VALUES (%s, %s, %s, 0, 0, 0, FALSE, %s, 0)
+                               FlightMinutes, QuotaMet, Rank, Strikes, ImmuneRoleStart)
+            VALUES (%s, %s, %s, 0, 0, 0, FALSE, %s, 0, {immune_start_date})
             """,
             (discord_id_str, fetched_id, fetched_name, rank)
         )
@@ -1064,21 +1101,26 @@ async def reset_strikes(ctx):
 @require_specific_role(REQUIRED_ROLE_ID_FOR_OTHERS)
 async def check_failed(ctx):
     """
-    Shows all users who have 2 or more strikes.
+    Shows all users who have 2 or more strikes OR have had the immune role for more than 2 weeks.
     Removes from DB those who left or have invalid ID.
     """
-    cursor.execute("SELECT DiscordID, Strikes FROM Users WHERE Strikes >= 2")
+    cursor.execute("""
+        SELECT DiscordID, Strikes, ImmuneRoleStart 
+        FROM Users 
+        WHERE Strikes >= 2 
+           OR (ImmuneRoleStart IS NOT NULL AND ImmuneRoleStart <= CURRENT_DATE - INTERVAL '14 days')
+    """)
     rows = cursor.fetchall()
 
     if not rows:
-        await ctx.send("No users currently have 2 or more strikes.")
+        await ctx.send("No users currently have 2 or more strikes or immune role for 2+ weeks.")
         return
 
     lines = []
     removed_count = 0
     await ctx.guild.chunk()
 
-    for (disc_id_str, strikes) in rows:
+    for (disc_id_str, strikes, immune_start) in rows:
         if not disc_id_str.isdigit():
             # remove
             cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
@@ -1094,10 +1136,13 @@ async def check_failed(ctx):
             removed_count += 1
             continue
 
-        lines.append(f"• {member.mention} has **{strikes}** strike(s).")
+        if strikes >= 2:
+            lines.append(f"• {member.mention} has **{strikes}** strike(s).")
+        elif immune_start:
+            lines.append(f"• {member.mention} has had immune role for **2+ weeks** (since {immune_start}).")
 
     if not lines:
-        msg = "No valid users with 2+ strikes in the database."
+        msg = "No valid users with 2+ strikes or immune role for 2+ weeks in the database."
         if removed_count > 0:
             msg += f" Removed {removed_count} invalid entries."
         await ctx.send(msg)
@@ -1110,7 +1155,7 @@ async def check_failed(ctx):
     chunks = chunk_string(big_str)
     for i, chunk in enumerate(chunks, 1):
         embed = discord.Embed(
-            title=f"Users with 2+ Strikes (Page {i}/{len(chunks)})",
+            title=f"Users with 2+ Strikes or 2+ Week Immune Role (Page {i}/{len(chunks)})",
             description=chunk,
             color=discord.Color.red()
         )
