@@ -5,7 +5,6 @@ import asyncio
 import requests
 import time
 import os
-import datetime
 
 print("this is a test change")
 
@@ -368,7 +367,7 @@ async def log_event(ctx):
 
     # Co-host
     await ctx.send(
-        "Please **mention your co-host** (one user) or type **`none`** if no co-host.\n"
+        "Please **mention your co-host** (one user) or type **none** if no co-host.\n"
         "You have 60 seconds to respond."
     )
     try:
@@ -404,7 +403,7 @@ async def log_event(ctx):
     attendees_input = []
     await ctx.send(
         "**Enter each attendee one by one** (Mention with @[DISCORD USER]).\n"
-        "Type **`done`** when finished. You have 60 seconds per entry."
+        "Type **done** when finished. You have 60 seconds per entry."
     )
     while True:
         try:
@@ -418,7 +417,7 @@ async def log_event(ctx):
             await ctx.send("✅ Finished collecting attendees.")
             break
         attendees_input.append(msg)
-        await ctx.send(f"Got: `{content}`. Enter another attendee or `done`...")
+        await ctx.send(f"Got: {content}. Enter another attendee or done...")
 
     if not attendees_input:
         await ctx.send("No attendees were provided. Command cancelled.")
@@ -489,7 +488,7 @@ async def log_event(ctx):
             attendee_pings_for_summary.append(f"RobloxID:{roblox_id}")
 
         else:
-            await ctx.send(f"❌ Could not parse attendee: `{content}`. Skipping.")
+            await ctx.send(f"❌ Could not parse attendee: {content}. Skipping.")
             continue
 
         await asyncio.sleep(RATE_LIMIT_DELAY)
@@ -666,19 +665,17 @@ async def report_quota(ctx):
         if disc_id_str.isdigit():
             member = ctx.guild.get_member(int(disc_id_str))
             if not member:
+                # user left, remove from DB
                 cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
                 conn.commit()
                 removed_count += 1
             else:
-                # Ignore if user has the special ignore role
-                if any(role.id == SPECIAL_IGNORE_ROLE_ID for role in member.roles):
-                    update_ignore_role_since(member)
-                    continue
                 # Check if the member has an exempt role
                 if any(role.id in exempt_role_ids for role in member.roles):
                     continue
                 lines.append(f"• {member.mention}")
         else:
+            # if DiscordID not numeric, remove
             cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
             conn.commit()
             removed_count += 1
@@ -875,7 +872,7 @@ async def ping_unregistered(ctx):
 async def purge_database(ctx):
     await ctx.send(
         "⚠️ **Are you sure you want to purge the database?**\n"
-        "Type `confirm` to proceed or `cancel` to abort."
+        "Type confirm to proceed or cancel to abort."
     )
 
     def check_confirm(m):
@@ -990,11 +987,6 @@ async def enforce_quota(ctx):
             removed_count += 1
             continue
 
-        # Ignore if user has the special ignore role
-        if any(role.id == SPECIAL_IGNORE_ROLE_ID for role in member.roles):
-            update_ignore_role_since(member)
-            continue
-
         # Check exempt roles
         if any(role.id in exempt_role_ids for role in member.roles):
             continue
@@ -1074,27 +1066,21 @@ async def check_failed(ctx):
     """
     Shows all users who have 2 or more strikes.
     Removes from DB those who left or have invalid ID.
-    Flags users with the special ignore role for >2 weeks for removal.
     """
-    cursor.execute("SELECT DiscordID, Strikes, IgnoreRoleSince FROM Users WHERE Strikes >= 2 OR IgnoreRoleSince IS NOT NULL")
+    cursor.execute("SELECT DiscordID, Strikes FROM Users WHERE Strikes >= 2")
     rows = cursor.fetchall()
 
     if not rows:
-        await ctx.send("No users currently have 2 or more strikes or flagged for removal.")
+        await ctx.send("No users currently have 2 or more strikes.")
         return
 
     lines = []
     removed_count = 0
-    flagged_count = 0
     await ctx.guild.chunk()
-    now = datetime.datetime.utcnow()
 
-    for row in rows:
-        disc_id_str = row[0]
-        strikes = row[1]
-        ignore_role_since = row[2]
-
+    for (disc_id_str, strikes) in rows:
         if not disc_id_str.isdigit():
+            # remove
             cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
             conn.commit()
             removed_count += 1
@@ -1102,32 +1088,16 @@ async def check_failed(ctx):
 
         member = ctx.guild.get_member(int(disc_id_str))
         if not member:
+            # remove
             cursor.execute("DELETE FROM Users WHERE DiscordID=%s", (disc_id_str,))
             conn.commit()
             removed_count += 1
             continue
 
-        # If user has the special ignore role, check how long they've had it
-        if any(role.id == SPECIAL_IGNORE_ROLE_ID for role in member.roles):
-            update_ignore_role_since(member)
-            if ignore_role_since:
-                try:
-                    held_since = ignore_role_since
-                    if isinstance(held_since, str):
-                        held_since = datetime.datetime.fromisoformat(held_since)
-                    days_held = (now - held_since).days
-                    if days_held >= 14:
-                        lines.append(f"⚠️ {member.mention} has held the ignore role for **{days_held} days**. Please review/remove.")
-                        flagged_count += 1
-                        continue
-                except Exception:
-                    pass
-        # Otherwise, only show if they have 2+ strikes
-        if strikes >= 2:
-            lines.append(f"• {member.mention} has **{strikes}** strike(s).")
+        lines.append(f"• {member.mention} has **{strikes}** strike(s).")
 
     if not lines:
-        msg = "No valid users with 2+ strikes or flagged for removal in the database."
+        msg = "No valid users with 2+ strikes in the database."
         if removed_count > 0:
             msg += f" Removed {removed_count} invalid entries."
         await ctx.send(msg)
@@ -1140,9 +1110,9 @@ async def check_failed(ctx):
     chunks = chunk_string(big_str)
     for i, chunk in enumerate(chunks, 1):
         embed = discord.Embed(
-            title=f"Users with 2+ Strikes or Flagged (Page {i}/{len(chunks)})",
+            title=f"Users with 2+ Strikes (Page {i}/{len(chunks)})",
             description=chunk,
-            color=discord.Color.red() if flagged_count == 0 else discord.Color.orange()
+            color=discord.Color.red()
         )
         if removed_count > 0 and i == 1:
             embed.set_footer(text=f"Removed {removed_count} invalid user(s).")
@@ -1580,4 +1550,7 @@ async def on_reaction_add(reaction, user):
         # Remove from pending requests
         del pending_inactivity_requests[msg_id]
 
+# --------------------------------------------------------------------
+# RUN THE BOT
+# --------------------------------------------------------------------
 bot.run(BOT_TOKEN)
