@@ -1579,3 +1579,5 @@ async def on_reaction_add(reaction, user):
 
         # Remove from pending requests
         del pending_inactivity_requests[msg_id]
+
+bot.run(BOT_TOKEN)
