@@ -290,10 +290,9 @@ def ensure_user_record(member: discord.Member, guild: discord.Guild):
 def recalculate_quota():
     """
     Recalculate ‘QuotaMet’ for all users in the database:
-      - 2 events attended, OR
-      - 2 events hosted, OR
-      - (1 event attended AND >= 30 flight minutes), OR
-      - >= 60 flight minutes
+      - 1 events attended, OR
+      - 1 events hosted, OR
+      - >= 30 flight minutes
     """
     cursor.execute("SELECT DiscordID, EventsAttended, EventsHosted, FlightMinutes FROM Users")
     rows = cursor.fetchall()
@@ -304,10 +303,9 @@ def recalculate_quota():
         flight_minutes = flight_minutes or 0
 
         meets_quota = (
-            (attended >= 2)
-            or (hosted >= 2)
-            or (attended >= 1 and flight_minutes >= 30)
-            or (flight_minutes >= 60)
+            (attended >= 1)
+            or (hosted >= 1)
+            or (flight_minutes >= 30)
         )
         cursor.execute("UPDATE Users SET QuotaMet=%s WHERE DiscordID=%s", (meets_quota, disc_id))
 
