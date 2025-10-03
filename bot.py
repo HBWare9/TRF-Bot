@@ -573,6 +573,9 @@ async def log_event(ctx):
         
 @bot.command(name="leaderboard")
 async def leaderboard(ctx):
+    if not user_has_any_allowed_role(ctx.author):
+        await ctx.send("❌ You do not have permission to use this command.")
+        return
     """
     Displays the top 15 most active pilots
     """
@@ -586,6 +589,25 @@ async def leaderboard(ctx):
     lb_message = "**Top 15 Most Active Pilots**\n"
     for idpilot, (discordid, eventsattended) in enumerate(top_fifteen_pilots, start=1):
         lb_message += f"{idpilot}: <@{discordid}> > {eventsattended} events attended\n"
+
+    await ctx.send(lb_message)
+    
+@bot.command(name="Officer_LB")
+async def Officer_LB(ctx):
+    """
+    Displays most active Squadron Leaders in order.
+    """
+    
+    top_active_SLs = []
+    cursor.execute("SELECT discordid, eventshosted FROM users WHERE rank='Squadron Leader' OR rank='Rear Admiral' ORDER BY eventshosted DESC LIMIT 15")
+    top_active_SLs = cursor.fetchall()
+    if not top_active_SLs:
+        await ctx.send("There are no squadron leaders or rear admirals who have hosted this quota cycle")
+        return
+    
+    lb_message = "**Top Active Squadron Leaders**\n"
+    for idSL, (discordid, eventshosted) in enumerate(top_active_SLs, index=1):
+        lb_message += f"{idSL}: <@{discordid}> > {eventshosted} events hosted"
 
     await ctx.send(lb_message)
 
