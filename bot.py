@@ -569,6 +569,31 @@ async def log_event(ctx):
 
     if attendees_processed:
         await final_channel.send(f"**Attendees DB Updated:** {', '.join(attendees_processed)}")
+        
+        
+@bot.command(name="leaderboard")
+async def leaderboard(ctx):
+    """
+    Displays the top 15 most active pilots
+    """
+
+    leaderboard_dict = []
+    top_fifteen_pilots = []
+    cursor.execute("SELECT discordid, eventsattended FROM users ORDER BY eventsattended DESC LIMIT 15")
+    top_fifteen_pilots = cursor.fetchall()
+    if not top_fifteen_pilots:
+        await ctx.send("No pilots found in the database.")
+        return 
+    for discordid, eventsattended in top_fifteen_pilots:
+        leaderboard_dict.append({"discordid": discordid, "eventsattended": eventsattended})
+
+    await ctx.send("**Top 15 Active Pilots:**")
+    for pilot in leaderboard_dict:
+        await ctx.send(f"Pilot ID: {pilot['discordid']}, Events Attended: {pilot['eventsattended']}")
+
+    await ctx.send("**Top 15 Active Pilots:**")
+    for pilot in top_fifteen_pilots:
+        await ctx.send(f"Pilot ID: {pilot[0]}, Events Attended: {pilot[1]}")
 
 @bot.command(name="manual_log")
 async def manual_log(ctx, user: discord.Member):
