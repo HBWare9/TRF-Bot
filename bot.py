@@ -599,7 +599,7 @@ async def Officer_LB(ctx):
     """
     
     top_active_SLs = []
-    cursor.execute("SELECT discordid, eventshosted FROM users WHERE rank='Squadron Leader' OR rank='Rear Admiral' ORDER BY eventshosted DESC LIMIT 15")
+    cursor.execute("SELECT discordid, eventshosted FROM users WHERE rank='Squadron Leader' OR rank='Wing Commander' OR rank='Group Commandant' ORDER BY eventshosted DESC LIMIT 15")
     top_active_SLs = cursor.fetchall()
     if not top_active_SLs:
         await ctx.send("There are no squadron leaders or rear admirals who have hosted this quota cycle")
