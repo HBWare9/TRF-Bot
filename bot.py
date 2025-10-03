@@ -606,8 +606,8 @@ async def Officer_LB(ctx):
         return
     
     lb_message = "**Top Active Squadron Leaders**\n"
-    for idSL, (discordid, eventshosted) in enumerate(top_active_SLs, index=1):
-        lb_message += f"{idSL}: <@{discordid}> > {eventshosted} events hosted"
+    for idSL, (discordid, eventshosted) in enumerate(top_active_SLs, start=1):
+        lb_message += f"{idSL}: <@{discordid}> > {eventshosted} events hosted\n"
 
     await ctx.send(lb_message)
 
