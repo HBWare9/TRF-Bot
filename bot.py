@@ -387,12 +387,14 @@ async def log_flight(ctx):
     embed = discord.Embed(title="Flight Log Review", color=discord.Color.blue())
     embed.add_field(name="User", value=ctx.author.display_name, inline=True)
     embed.add_field(name="Minutes", value=str(minutes), inline=True)
+    embed.add_field(name="Kills", value=str(kills), inline=True)
     embed.set_image(url=attachment_url)
 
     review_message = await review_channel.send(embed=embed)
     pending_flight_logs[review_message.id] = {
         "user_id": ctx.author.id,
         "minutes": minutes,
+        "kills": kills,
         "origin_channel_id": ctx.channel.id,
     }
 
