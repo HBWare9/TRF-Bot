@@ -335,6 +335,12 @@ async def log_flight(ctx):
     except asyncio.TimeoutError:
         await ctx.send("❌ You took too long to respond. Please try again.")
         return
+    await ctx.send("💀 How many kills did you gain during your flight?")
+    try:
+        kills_msg = await bot.wait_for("message", timeout=60.0, check=check_author)
+    except asyncio.TimeoutError:
+        await ctx.send("You took too long to respond. Please try again.")
+        return
 
     # Validate minutes
     try:
@@ -345,12 +351,22 @@ async def log_flight(ctx):
     except ValueError:
         await ctx.send("❌ Please enter a valid number of minutes.")
         return
+    
+    # Validate kills
+    try:
+        kills = int(kills_msg.content)
+        if kills <= 0:
+            await ctx.send("❌ You must have atleast one kill for your flight log to be valid.")
+            return 
+    except ValueError:
+        await ctx.send("❌ Please enter a valid number of kills")
+        return
 
     # Ensure the user is in the DB right away
     ensure_user_record(ctx.author, ctx.guild)
 
     # Step 2: screenshot prompt
-    await ctx.send("📸 Please provide a screenshot of your flight time.")
+    await ctx.send("📸 Please provide a screenshot of your flight time and kills.")
     try:
         screenshot_msg = await bot.wait_for("message", timeout=120.0, check=check_author)
     except asyncio.TimeoutError:
@@ -1542,6 +1558,7 @@ async def on_reaction_add(reaction, user):
         flight_log = pending_flight_logs[msg_id]
         flight_user_id = flight_log["user_id"]
         minutes = flight_log["minutes"]
+        kills = flight_log["kills"]
         origin_channel_id = flight_log["origin_channel_id"]
 
         if str(reaction.emoji) not in ["✅", "❌"]:
@@ -1556,15 +1573,15 @@ async def on_reaction_add(reaction, user):
             if member:
                 ensure_user_record(member, reaction.message.guild)
                 cursor.execute(
-                    "UPDATE Users SET FlightMinutes = FlightMinutes + %s WHERE DiscordID = %s",
-                    (minutes, disc_id)
+                    "UPDATE Users SET FlightMinutes = FlightMinutes + %s, weeklykills = weeklykills + %s WHERE DiscordID = %s",
+                    (minutes,  kills, disc_id)
                 )
                 conn.commit()
                 recalculate_quota()
                 if origin_channel:
                     await origin_channel.send(
                         f"✅ <@{flight_user_id}>, your flight log has been approved "
-                        f"and {minutes} minutes have been added to your record."
+                        f"and {minutes} minutes alongside {kills} kills have been added to your record."
                     )
             else:
                 # user left => remove from DB
